@@ -288,3 +288,64 @@ __global__ void simulate_worker_kernel_warp(
         __syncwarp();
     }
 }
+
+// ============================================================
+// GPU capacity-delta (P9 prep on device)
+// ============================================================
+//
+// Moves compute_capacity_delta_other_threads onto the GPU. capacity_delta is the
+// largest per-window structure (evc·np1) and was both computed on the host (a
+// 31M-element cumsum + gather, the steady-state prep bottleneck) and uploaded H2D
+// (124 MB). Quantities are all 1, so every cumsum partial is an exact integer
+// (|·| ≤ eff ≪ 2^24) — float adds are exact regardless of order — so the device
+// result is **bit-identical** to the host version.
+
+// Per-column prefix sum: cumsum[t,n] = -count(s<=t : fulfill[s]==n) (×quantity).
+// One thread per node-column (np1 ≤ 64); the column scan stays serial in t so the
+// add order matches the host exactly, and the np1 writes at each t are contiguous
+// (coalesced). Launch <<<1, np1>>>.
+__global__ void capacity_cumsum_kernel(
+    const int* __restrict__ fulfill,    // [eff]
+    const int* __restrict__ quant,      // [eff]
+    int eff, int np1,
+    float* __restrict__ cumsum          // [eff, np1]
+) {
+    int n = threadIdx.x;
+    if (n >= np1) return;
+    float acc = 0.0f;
+    for (int t = 0; t < eff; t++) {
+        if (fulfill[t] == n) acc -= (float)quant[t];
+        cumsum[(size_t)t * np1 + n] = acc;
+    }
+}
+
+// Gather: capacity_delta[w,s,n] = -((caps[w,s,n] - caps[w,s-1,n]) - by_product),
+// caps[w,s,n] = cumsum[order_rel[w,s], n] (0 if the slot is empty). One thread per
+// output element (tid = (w·num_steps+s)·np1 + n); writes and the cumsum reads for a
+// warp (fixed slot, consecutive n) are coalesced. Mirrors the host gather exactly.
+__global__ void capacity_gather_kernel(
+    const float* __restrict__ cumsum,   // [eff, np1]
+    const int* __restrict__ order_rel,  // [n_workers*num_steps], in [0,eff) or -1
+    const int* __restrict__ fulfill,    // [eff]
+    const int* __restrict__ quant,      // [eff]
+    int n_workers, int num_steps, int eff, int np1,
+    float* __restrict__ cap_delta       // [n_workers*num_steps, np1]
+) {
+    long tid = blockIdx.x * (long)blockDim.x + threadIdx.x;
+    long total = (long)n_workers * num_steps * np1;
+    if (tid >= total) return;
+    int n  = (int)(tid % np1);
+    long ws = tid / np1;                 // worker*num_steps + s
+    int s  = (int)(ws % num_steps);
+
+    int idx = order_rel[ws];
+    float cap_val = (idx >= 0 && idx < eff) ? cumsum[(size_t)idx * np1 + n] : 0.0f;
+    float cap_prev = 0.0f;
+    if (s > 0) {
+        int pidx = order_rel[ws - 1];
+        if (pidx >= 0 && pidx < eff) cap_prev = cumsum[(size_t)pidx * np1 + n];
+    }
+    float cd = cap_val - cap_prev;
+    float by_product = (idx >= 0 && idx < eff && fulfill[idx] == n) ? -(float)quant[idx] : 0.0f;
+    cap_delta[tid] = -(cd - by_product);
+}

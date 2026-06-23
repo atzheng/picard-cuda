@@ -153,6 +153,7 @@ GPU-port prep).
 | E5 (#10 P5b prep scan) | 0.870 s | 130.2× |
 | E6 (#11 init + #12 ntf elim) | 0.756 s | 149.8× |
 | E7 (#13 inventory scratch) | 0.712 s | 159.1× |
+| E8 (#14 GPU capacity_delta) | 0.555 s | 204.1× |
 
 ---
 
@@ -234,3 +235,29 @@ huge pages), so further wins must shrink the footprint (P13: `worker_inv`) or th
 9.4 ms (5.3%), D2H 0.9 ms; the rest is prep (compute + one-time iter-1 faulting). The
 big per-window H2D buffers are gone except `cap_delta` (124 MB); the next lever is
 GPU-porting prep (P9). See `OPTIMIZATIONS.md` "Next steps".
+
+---
+
+## E8 — Same workload after GPU capacity_delta (#14, first slice of P9)
+
+- **Commit:** _(this commit)_ — `compute_capacity_delta` moved onto the GPU
+  (`capacity_cumsum_kernel` + `capacity_gather_kernel`). Only the 3 small inputs are
+  uploaded (slice_fulfill, slice_quantities, order_2D_relative, 3×4 MB); the 124 MB
+  `capacity_delta` is produced and consumed on-device. See `OPTIMIZATIONS.md` §14.
+- **Correctness — bit-identical.** Quantities are all 1, so every cumsum partial is an
+  exact integer and float adds are order-independent. `LEGACY_KERNEL=1`: **0/1,000,000**
+  vs. sequential (4 iters, conflicts 1); warp kernel 0/1,000,000; sub100k C and A 0.
+
+| Mode | Configuration | Wall time | Detail |
+|------|---------------|----------:|--------|
+| Sequential | single-thread scan | 113.25 s | unchanged |
+| Parallel (Picard, warp kernel) | 10,000 workers × 100 steps/worker | **0.555 s** | 4 iterations, 1 conflict |
+
+**Speedup: 204.1×** (113.25 s → 0.555 s) — up from 159.1× (E7); crosses 200×. Host
+prep collapsed **124 → 12 ms/iter**, H2D **13.2 → 6.3 ms/iter**.
+
+**Phase profile (`PROFILE=1`):** kernel 98.8 ms (76.9%) — this now includes the GPU
+`capacity_delta` (~70 ms/iter, almost all the single-block cumsum) plus the
+fulfillment kernel (~29 ms); prep 12.2 ms (9.5%), post 10.5 ms (8.2%), H2D 6.3 ms
+(4.9%). The single-block cumsum is the new bottleneck — a multi-block parallel scan
+(#15) is the next step. See `OPTIMIZATIONS.md` "Next steps".

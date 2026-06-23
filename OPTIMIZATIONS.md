@@ -43,6 +43,7 @@ All numbers best-of-3, measured together in a single run for consistency.
 | 11 | No-init scratch allocator (init cleanup) | 0.144 s | 0.100 s | ~flat | 3.62× |
 | 12 | Eliminate ev2d_ntf — kernel gathers device ntf | 0.141 s | 0.098 s | ~flat | 3.62× |
 | 13 | Replace worker_inv with full inventory scratch | 0.147 s | 0.093 s | ~flat | 3.62× |
+| 14 | GPU capacity_delta (P9 prep on device) | 0.112 s | 0.074 s | 1.31× | 4.74× |
 
 (#4–#7 and #10 were driven by the **1M-event** workload where `prep` dominates — see
 the "Scaling to 1,000,000 events" section below for the per-step phase breakdown; the
@@ -467,24 +468,75 @@ post (CPU)      5.3%    9.4 ms/iter
 D2H readback    0.5%    0.9 ms/iter
 ```
 
+### 14. GPU `capacity_delta` (first slice of P9 — prep on device)
+
+**Diagnosis.** After #13, the dominant per-iteration host cost was
+`compute_capacity_delta` — a 31M-element cumsum + a 31M-element gather producing the
+124 MB `capacity_delta`, which was then uploaded H2D (another 124 MB). It also forced
+two 124 MB host scratch buffers (`capacity_delta`, `cumsum_scratch`) to be allocated
+and faulted. Prep (compute + that faulting) was ~70% of the loop.
+
+**Exactness is free here.** Quantities are all **1**, so every cumsum partial is an
+exact integer (`|·| ≤ eff ≪ 2²⁴`) — IEEE float addition of such integers is exact
+*regardless of order*. So a parallel GPU `capacity_delta` is **bit-identical** to the
+host version, even though `capacity_delta` feeds the *hard* feasibility threshold.
+
+**Change.** Two device kernels (`include/simulation.h`):
+- `capacity_cumsum_kernel` — per-column prefix sum `cumsum[t,n] = -count(s≤t :
+  fulfill[s]=n)`. One thread per node-column, serial in `t` (matches host add order),
+  the `np1` writes per `t` coalesced.
+- `capacity_gather_kernel` — one thread per output element, fully parallel; mirrors
+  the host gather exactly.
+Per iteration we now upload only the 3 small inputs (`slice_fulfill`,
+`slice_quantities`, `order_2D_relative`, 3×4 MB) and produce the 124 MB
+`capacity_delta` on-device; the host cumsum/gather, both 124 MB host buffers, and the
+124 MB H2D are gone. **Bit-identical**: `LEGACY_KERNEL=1` 0/1,000,000 (4 iters,
+conflicts 1); warp 0/1,000,000; sub100k C/A 0.
+
+**Result.** prep **124 → 12 ms/iter**; H2D **13.2 → 6.3 ms/iter**; 1M wall
+**0.712 → 0.555 s**. Cumulative vs. sequential: 113.25 s → 0.555 s = **204.1×**
+(crosses 200×). sub100k C 0.147 → 0.112 s, A 0.093 → 0.074 s.
+
+**New bottleneck.** The GPU `capacity_delta` runs on the same stream before the
+fulfillment kernel, so it is folded into the "kernel" phase, which jumped 28.7 →
+98.8 ms/iter — i.e. the device `cap_delta` is ~70 ms/iter, almost all of it the
+**single-block** cumsum (`<<<1, np1>>>`, latency-bound on a 1M-long serial scan). A
+multi-block parallel scan is the obvious next step (#15).
+
+**Profile after (1M, `PROFILE=1`):**
+```
+[init] D2H state    39 ms
+kernel         76.9%   98.8 ms/iter   (fulfillment ~29 + GPU cap_delta ~70; cumsum-bound)
+prep (CPU)      9.5%   12.2 ms/iter
+post (CPU)      8.2%   10.5 ms/iter
+H2D upload      4.9%    6.3 ms/iter
+D2H readback    0.6%    0.7 ms/iter
+```
+
 ---
 
 ## Next steps (diagnosed, not yet implemented)
 
-P4–P9, P5b (#10), init cleanup (#11), ntf elimination (#12), and the inventory
-scratch (#13) are **done**. At 1M / 4 iterations the **wall (0.712 s) is now roughly
-half one-time setup and half loop**: `init` D2H-state (~39 ms) + first-touch faulting
-of the remaining ~330 MB scratch (folded into iter-1 prep), plus the 4-iteration loop
-(kernel 28.7, H2D 13.2, post 9.4, and steady-state prep compute ~50 ms/iter). The big
-per-window H2D buffers are gone (only `cap_delta` 124 MB remains); faulting can't be
-made cheaper here (no huge pages, #11). Remaining levers, in rough priority:
+P4–P8, P5b (#10), init cleanup (#11), ntf elimination (#12), the inventory
+scratch (#13), and the first slice of P9 — GPU `capacity_delta` (#14) — are **done**.
+At 1M / 4 iterations the **wall is 0.555 s**, and the loop is now dominated by the
+device `capacity_delta` (~70 ms/iter, almost all the single-block cumsum). Host prep
+collapsed to ~12 ms/iter and H2D to ~6 ms. Remaining levers, in rough priority:
 
-### P9 — Move prep onto the GPU (architectural, highest ceiling)
-prep is now the bulk of the loop and is pure array transforms (gather/scatter,
-counting, cumsum) on data already bound for the device. Porting it to CUDA removes the
-CPU — and most of the host scratch faulting — from the hot path entirely. It would
-also let `cap_delta` (the last big per-window buffer, 124 MB) be produced and consumed
-on-device, eliminating its H2D. Largest effort, highest ceiling.
+### #15 — Multi-block parallel cumsum (immediate)
+The GPU `capacity_cumsum_kernel` is `<<<1, np1>>>` — one block, latency-bound on a
+1M-long serial scan per column, ~70 ms/iter and now the top cost. A standard
+two-level (scan-then-propagate) multi-block scan, or per-column block-scan with
+carry, parallelizes it across SMs. Still exact (integer partials). Highest immediate
+return.
+
+### P9 (rest) — move the remaining prep onto the GPU
+With `capacity_delta` on-device, the remaining host prep (get_slice, worker mapping,
+`cum_count`, `order_2D_index` scatter, valid_mask, the ev2d_* scalars) is ~12 ms/iter.
+Porting it removes the CPU and the last host faulting from the hot path. `cum_count`
+needs an order-preserving (stable) GPU segmented rank; the `order_2D_index` scatter is
+trivially parallel. Larger effort, smaller remaining return now that the big buffer is
+gone.
 
 ### Device-resident inventory (drop the 70 MB/iter upload, #13 follow-on)
 Keep inventory resident on the GPU and apply only the small committed
@@ -509,5 +561,6 @@ re-validated against the decision tolerance.
 | +#10 P5b prep scan | 0.870 s | exact; 130.2× vs sequential |
 | +#11 init no-init scratch | 0.870 s | wall-neutral (faulting floor) |
 | +#12 eliminate ev2d_ntf | 0.756 s | exact; 149.8× vs sequential |
-| **+#13 inventory scratch (done)** | **0.712 s** | **exact; 159.1× vs sequential** |
-| +P9 (GPU prep) | toward 0.5 s | removes CPU + most faulting/H2D from hot path |
+| +#13 inventory scratch | 0.712 s | exact; 159.1× vs sequential |
+| **+#14 GPU capacity_delta (done)** | **0.555 s** | **exact; 204.1× vs sequential** |
+| +#15 multi-block cumsum | toward 0.45 s | parallelize the single-block scan |

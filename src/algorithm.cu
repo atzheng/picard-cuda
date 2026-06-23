@@ -223,8 +223,8 @@ struct IterContext {
     NoInitVec<int> product_worker_map, product_ids_within_worker;
     NoInitVec<int> workers, index_within_worker, cum_counts;
     NoInitVec<int> order_2D_index, valid_mask, order_2D_relative;
-    NoInitVec<float> capacity_delta;
-    NoInitVec<float> cumsum_scratch;  // [eff_num_steps * np1] prefix-scan buffer (P5b)
+    // capacity_delta is now produced on the GPU (P9); only its small inputs
+    // (slice_fulfill, slice_quantities, order_2D_relative) are uploaded.
     NoInitVec<int> ev2d_product, ev2d_quantity;
     NoInitVec<uint64_t> worker_keys;
     NoInitVec<int> fulfill_2D;
@@ -236,7 +236,12 @@ struct IterContext {
     int* d_ev_quantity = nullptr;
     const int* d_event_ntf_full = nullptr;  // borrowed: events.node_index_near_to_far (not owned)
     int* d_order_2D_index = nullptr;        // global event idx per slot (replaces d_ev_ntf, P12)
-    float* d_cap_delta = nullptr;
+    // GPU capacity-delta (P9): inputs uploaded, cumsum + cap_delta produced on device.
+    int* d_slice_fulfill = nullptr;         // [eff]
+    int* d_slice_quantities = nullptr;      // [eff]
+    int* d_order_2D_relative = nullptr;     // [evc], in [0,eff) or -1
+    float* d_cumsum = nullptr;              // [eff, np1] device scratch
+    float* d_cap_delta = nullptr;           // [evc, np1] — now written by the gather kernel
     int* d_valid_mask = nullptr;
     uint64_t* d_worker_keys = nullptr;
     int* d_fulfill_2D = nullptr;
@@ -309,8 +314,6 @@ static void init_iter_context(
     ctx.order_2D_index.resize(evc);
     ctx.valid_mask.resize(evc);
     ctx.order_2D_relative.resize(evc);
-    ctx.capacity_delta.resize(evc * np1);
-    ctx.cumsum_scratch.resize((size_t)ens * np1);
     ctx.ev2d_product.resize(evc);
     ctx.ev2d_quantity.resize(evc);
     ctx.worker_keys.resize(ctx.n_workers);
@@ -326,6 +329,11 @@ static void init_iter_context(
     CUDA_CHECK(cudaMalloc(&ctx.d_ev_quantity, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_order_2D_index, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_cap_delta, ctx.ev_count * np1 * sizeof(float)));
+    // GPU capacity-delta scratch + inputs (P9).
+    CUDA_CHECK(cudaMalloc(&ctx.d_slice_fulfill, (size_t)ens * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ctx.d_slice_quantities, (size_t)ens * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ctx.d_order_2D_relative, ctx.ev_count * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ctx.d_cumsum, (size_t)ens * np1 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx.d_valid_mask, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_worker_keys, ctx.n_workers * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&ctx.d_fulfill_2D, ctx.ev_count * sizeof(int)));
@@ -348,6 +356,10 @@ static void free_iter_context(IterContext& ctx) {
     cudaFree(ctx.d_ev_quantity);
     cudaFree(ctx.d_order_2D_index);
     cudaFree(ctx.d_cap_delta);
+    cudaFree(ctx.d_slice_fulfill);
+    cudaFree(ctx.d_slice_quantities);
+    cudaFree(ctx.d_order_2D_relative);
+    cudaFree(ctx.d_cumsum);
     cudaFree(ctx.d_valid_mask);
     cudaFree(ctx.d_worker_keys);
     cudaFree(ctx.d_fulfill_2D);
@@ -389,7 +401,6 @@ static void iterate_core(
     auto& order_2D_index = ctx.order_2D_index;
     auto& valid_mask = ctx.valid_mask;
     auto& order_2D_relative = ctx.order_2D_relative;
-    auto& capacity_delta = ctx.capacity_delta;
     auto& ev2d_product = ctx.ev2d_product;
     auto& ev2d_quantity = ctx.ev2d_quantity;
 
@@ -450,10 +461,8 @@ static void iterate_core(
         order_2D_relative[i] = v ? (order_2D_index[i] - algo_state.t_reset) : -1;
     }
 
-    compute_capacity_delta_other_threads(
-        np1, slice_fulfill.data(), slice_quantities.data(),
-        order_2D_relative.data(), n_workers, num_steps, eff_num_steps,
-        capacity_delta.data(), ctx.cumsum_scratch.data());
+    // capacity_delta is computed on the GPU now (P9) — see Step 3, after its inputs
+    // (slice_fulfill, slice_quantities, order_2D_relative) are uploaded.
 
     // --- Step 2: Build the per-slot event scalars for the kernel ---
     // No inventory reshape anymore: the kernel reads each event's inventory row
@@ -498,9 +507,13 @@ static void iterate_core(
     // P12: upload the per-slot global event index (4 MB) instead of the per-window
     // ntf (124 MB); the kernel gathers the ntf row from the device-resident full ntf.
     CUDA_CHECK(cudaMemcpy(ctx.d_order_2D_index, order_2D_index.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(ctx.d_cap_delta, capacity_delta.data(), ev_count * np1 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_valid_mask, valid_mask.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_worker_keys, worker_keys.data(), n_workers * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    // P9: upload only capacity_delta's small inputs (3×4 MB) and produce the 124 MB
+    // capacity_delta on the device — no host cumsum/gather, no 124 MB H2D.
+    CUDA_CHECK(cudaMemcpy(ctx.d_slice_fulfill, slice_fulfill.data(), eff_num_steps * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx.d_slice_quantities, slice_quantities.data(), eff_num_steps * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx.d_order_2D_relative, order_2D_relative.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
 
     // The kernel reads its initial capacity from the device; sync the current
     // (pre-step) host capacity into the device buffer just before launch.
@@ -508,6 +521,20 @@ static void iterate_core(
                           np1 * sizeof(float), cudaMemcpyHostToDevice));
 
     if (prof.on) { prof.h2d += prof_now() - tp; tp = prof_now(); }
+
+    // P9: produce capacity_delta on the device. The per-column cumsum (serial in t,
+    // exact since quantities are integers) feeds a fully-parallel gather. Same stream
+    // as the fulfillment kernel below, so it is ordered before the kernel reads it.
+    capacity_cumsum_kernel<<<1, np1>>>(
+        ctx.d_slice_fulfill, ctx.d_slice_quantities, eff_num_steps, np1, ctx.d_cumsum);
+    {
+        long total = (long)n_workers * num_steps * np1;
+        int threads = 256;
+        int blocks = (int)((total + threads - 1) / threads);
+        capacity_gather_kernel<<<blocks, threads>>>(
+            ctx.d_cumsum, ctx.d_order_2D_relative, ctx.d_slice_fulfill, ctx.d_slice_quantities,
+            n_workers, num_steps, eff_num_steps, np1, ctx.d_cap_delta);
+    }
 
     // Launch the fulfillment kernel. Default: warp-cooperative (P8) — one warp per
     // worker, parallelizing the per-event MLP across lanes. Set LEGACY_KERNEL=1 to
