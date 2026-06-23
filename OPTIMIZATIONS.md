@@ -42,6 +42,7 @@ All numbers best-of-3, measured together in a single run for consistency.
 | 10 | Parallel/persistent capacity-delta scan (P5b) | 0.167 s | 0.108 s | ~flat | 3.62× |
 | 11 | No-init scratch allocator (init cleanup) | 0.144 s | 0.100 s | ~flat | 3.62× |
 | 12 | Eliminate ev2d_ntf — kernel gathers device ntf | 0.141 s | 0.098 s | ~flat | 3.62× |
+| 13 | Replace worker_inv with full inventory scratch | 0.147 s | 0.093 s | ~flat | 3.62× |
 
 (#4–#7 and #10 were driven by the **1M-event** workload where `prep` dominates — see
 the "Scaling to 1,000,000 events" section below for the per-step phase breakdown; the
@@ -430,24 +431,66 @@ post (CPU)      6.5%    11.1 ms/iter
 D2H readback    0.5%     0.9 ms/iter
 ```
 
+### 13. Replace `worker_inv` with a full-inventory device scratch
+
+**Diagnosis.** After #12, `worker_inv` — the per-worker private inventory
+`[n_workers · max_ppw · np1]` (**124 MB at 1M**) — was the largest remaining host
+buffer, H2D payload, and reshape cost (an O(window·np1) scatter that copied each
+valid event's inventory row into it). But `random_assignment` partitions products
+**1:1 to workers**, so a worker only ever touches inventory rows for *its own*
+products — every worker's writes are disjoint.
+
+**Change.** Drop the per-worker copy entirely. Upload one fresh copy of the full
+authoritative inventory (`[n_products · np1]`, **70 MB**) into a device scratch each
+iteration, and have the kernel index it by the **original product id**
+(`inv_row = inventory_scratch + product·np1`). Disjoint products ⇒ no cross-worker
+race; the kernel mutates the scratch speculatively and it is re-seeded from
+`h_inventory` next iteration, exactly as `worker_inv` was. The reshape collapses to
+just staging the per-slot product id and quantity. Removed: the 124 MB `worker_inv`
+host buffer, its scatter loop, and `d_worker_inv`. **Bit-identical**:
+`LEGACY_KERNEL=1` 0/1,000,000 (4 iters, conflicts 1); warp 0/1,000,000; sub100k C/A 0.
+
+**Result.** reshape **5.6 → 2.1 ms/iter**; H2D **17.5 → 13.2 ms/iter** (124 → 70 MB
+upload); 1M wall **0.756 → 0.712 s**. Cumulative vs. sequential: 113.25 s → 0.712 s =
+**159.1×**. Host footprint ~124 MB smaller (less first-touch faulting). H2D is now
+only 7.5% — the inventory could go fully device-resident (commit the small
+`[t_reset,new_t_reset)` delta on-GPU) to drop even the 70 MB/iter, but the return is
+now small.
+
+**Profile after (1M, `PROFILE=1`):**
+```
+[init] D2H state    39 ms     (the last sizable one-time D2H)
+prep (CPU)     ~70%   reshape now 2.1 ms/iter (rest is compute + iter-1 faulting)
+kernel         16.3%   28.7 ms/iter
+H2D upload      7.5%   13.2 ms/iter
+post (CPU)      5.3%    9.4 ms/iter
+D2H readback    0.5%    0.9 ms/iter
+```
+
 ---
 
 ## Next steps (diagnosed, not yet implemented)
 
-P4–P9, P5b (#10), init cleanup (#11), and ntf elimination (#12) are **done**. At
-1M / 4 iterations the **wall (0.756 s) is now roughly half one-time setup and half
-loop**: `init` D2H-state (~38 ms) + first-touch faulting of the remaining ~450 MB
-scratch (folded into iter-1 prep), plus the 4-iteration loop (kernel 28.6, H2D 17.5,
-post 11.1, and the steady-state prep compute ~51 ms/iter). Because faulting can't be
-made cheaper here (no huge pages, #11), the remaining levers are **shrink footprint
-further** and **shrink the loop**. Targets:
+P4–P9, P5b (#10), init cleanup (#11), ntf elimination (#12), and the inventory
+scratch (#13) are **done**. At 1M / 4 iterations the **wall (0.712 s) is now roughly
+half one-time setup and half loop**: `init` D2H-state (~39 ms) + first-touch faulting
+of the remaining ~330 MB scratch (folded into iter-1 prep), plus the 4-iteration loop
+(kernel 28.7, H2D 13.2, post 9.4, and steady-state prep compute ~50 ms/iter). The big
+per-window H2D buffers are gone (only `cap_delta` 124 MB remains); faulting can't be
+made cheaper here (no huge pages, #11). Remaining levers, in rough priority:
 
-### P13 — Shrink `worker_inv` (largest remaining buffer, 124 MB)
-`worker_inv` is now the biggest per-window structure and H2D payload. Like #12, the
-inventory rows are device-resident (`state.inventory`) — but unlike ntf they mutate,
-so the kernel can't index them blindly. Options: keep inventory resident on the GPU
-and apply only the small committed `[t_reset,new_t_reset)` delta each iteration, or a
-compact `(worker,pid)`→row layout that uploads only touched rows.
+### P9 — Move prep onto the GPU (architectural, highest ceiling)
+prep is now the bulk of the loop and is pure array transforms (gather/scatter,
+counting, cumsum) on data already bound for the device. Porting it to CUDA removes the
+CPU — and most of the host scratch faulting — from the hot path entirely. It would
+also let `cap_delta` (the last big per-window buffer, 124 MB) be produced and consumed
+on-device, eliminating its H2D. Largest effort, highest ceiling.
+
+### Device-resident inventory (drop the 70 MB/iter upload, #13 follow-on)
+Keep inventory resident on the GPU and apply only the small committed
+`[t_reset,new_t_reset)` delta each iteration with a tiny kernel, instead of
+re-uploading the full 70 MB. Output is `fulfill` only, so inventory never needs to
+come back. Return is now small (H2D is 7.5%).
 
 ### P5c — Remaining serial prep (Fisher–Yates shuffle)
 The cumsum scan and assignment scatter are parallel; the serial pieces left in prep
@@ -455,15 +498,6 @@ are `cum_count` (O(window), ~2 ms — cheap) and the **Fisher–Yates shuffle** 
 `random_assignment` (`O(n_products)` ≈ 567K, serial RNG chain). Parallelizing it needs
 a different permutation algorithm, which changes the assignment and so must be
 re-validated against the decision tolerance.
-
-### P9 — Move prep onto the GPU (architectural, highest ceiling)
-prep is the bulk of the loop and is pure array transforms (gather/scatter, counting,
-cumsum) on data already bound for the device. Porting it to CUDA removes the CPU
-from the hot path entirely. Largest effort.
-
-### H2D (12.5%) — compact/pinned `worker_inv` upload
-The 12.7 MB `worker_inv` upload per iteration is mostly dead rows; a compact
-per-window layout or pinned host memory shrinks it.
 
 ### Projected trajectory (1M-event wall clock)
 | Step | wall | note |
@@ -474,5 +508,6 @@ per-window layout or pinned host memory shrinks it.
 | +#9 post O(window) | 1.09 s | exact; 104.2× vs sequential |
 | +#10 P5b prep scan | 0.870 s | exact; 130.2× vs sequential |
 | +#11 init no-init scratch | 0.870 s | wall-neutral (faulting floor) |
-| **+#12 eliminate ev2d_ntf (done)** | **0.756 s** | **exact; 149.8× vs sequential** |
-| +P13 / P9 (shrink worker_inv / GPU prep) | toward 0.5 s | less H2D+footprint / GPU-port |
+| +#12 eliminate ev2d_ntf | 0.756 s | exact; 149.8× vs sequential |
+| **+#13 inventory scratch (done)** | **0.712 s** | **exact; 159.1× vs sequential** |
+| +P9 (GPU prep) | toward 0.5 s | removes CPU + most faulting/H2D from hot path |

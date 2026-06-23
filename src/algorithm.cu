@@ -219,7 +219,6 @@ struct IterContext {
     // serial zero-fill, and the pages fault in (in parallel) during the OpenMP
     // write loops that fill them. This removed ~270 ms of init zero-fill (P11).
     int eff_num_steps = 0;
-    NoInitVec<float> worker_inv;
     NoInitVec<int> slice_products, slice_quantities, slice_fulfill;
     NoInitVec<int> product_worker_map, product_ids_within_worker;
     NoInitVec<int> workers, index_within_worker, cum_counts;
@@ -232,7 +231,7 @@ struct IterContext {
     NoInitVec<unsigned char> present;  // window presence bitmap for max_t_reset
 
     // Persistent device scratch (allocated once, reused each iteration).
-    float* d_worker_inv = nullptr;
+    float* d_inv_scratch = nullptr;     // [n_products, np1] — fresh inventory copy/iter (P13)
     int* d_ev_product = nullptr;
     int* d_ev_quantity = nullptr;
     const int* d_event_ntf_full = nullptr;  // borrowed: events.node_index_near_to_far (not owned)
@@ -294,10 +293,6 @@ static void init_iter_context(
 
     ctx.prof.on = (getenv("PROFILE") != nullptr);
 
-    // No zero-fill: every slot the kernel reads is overwritten by the reshape loop
-    // before upload, and untouched slots are never read (P2). Uninitialized is safe.
-    ctx.worker_inv.resize((size_t)ctx.n_workers * ctx.max_ppw * np1);
-
     // Size persistent prep scratch once. eff_num_steps and the window dims depend
     // only on config + n_events, so they are fixed across the whole loop.
     ctx.eff_num_steps = std::min(ctx.num_steps * ctx.n_workers, ctx.n_events);
@@ -324,8 +319,9 @@ static void init_iter_context(
     mark("host resizes");
 
     // Per-iteration buffer sizes depend only on config dims, so allocate once.
-    size_t inv_bytes = (size_t)ctx.n_workers * ctx.max_ppw * np1 * sizeof(float);
-    CUDA_CHECK(cudaMalloc(&ctx.d_worker_inv, inv_bytes));
+    // d_inv_scratch holds the full inventory ([n_products, np1]) — a fresh copy of
+    // the authoritative host inventory is uploaded into it each iteration (P13).
+    CUDA_CHECK(cudaMalloc(&ctx.d_inv_scratch, (size_t)ctx.n_products * np1 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx.d_ev_product, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_ev_quantity, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_order_2D_index, ctx.ev_count * sizeof(int)));
@@ -347,7 +343,7 @@ static void finalize_iter_context(IterContext& ctx, AlgoState& s) {
 }
 
 static void free_iter_context(IterContext& ctx) {
-    cudaFree(ctx.d_worker_inv);
+    cudaFree(ctx.d_inv_scratch);
     cudaFree(ctx.d_ev_product);
     cudaFree(ctx.d_ev_quantity);
     cudaFree(ctx.d_order_2D_index);
@@ -459,35 +455,20 @@ static void iterate_core(
         order_2D_relative.data(), n_workers, num_steps, eff_num_steps,
         capacity_delta.data(), ctx.cumsum_scratch.data());
 
-    // --- Step 2: Build event arrays for the kernel ---
-    // Window-scoped inventory reshape. The kernel only ever reads the inventory
-    // row of a (worker, pid) slot that a VALID event maps to, so we scatter just
-    // those rows — one per valid event, O(window) — instead of all n_products
-    // rows. We also skip zeroing the (large, persistent) worker_inv buffer: every
-    // slot the kernel reads is overwritten here from the authoritative host
-    // inventory before upload, and untouched slots are never read.
+    // --- Step 2: Build the per-slot event scalars for the kernel ---
+    // No inventory reshape anymore: the kernel reads each event's inventory row
+    // straight from the full device-resident inventory (d_inv_scratch), indexed by
+    // the original product id — products are partitioned 1:1 to workers, so the rows
+    // a worker touches are disjoint from every other worker's (P13). The near-to-far
+    // ordering is likewise gathered on-device by global index (P12). So all that is
+    // left to stage per slot is the product id and quantity.
     double tr = prof.on ? prof_now() : 0.0;
-    auto& worker_inv = ctx.worker_inv;
-
-    // Independent per slot i. Two valid events that share a product map to the
-    // same worker_inv (w,pid) row, but they also share the same source inventory
-    // row, so the (identical-value) overlapping writes are race-free for results.
-    // The near-to-far ordering is no longer materialized here: the kernel reads it
-    // straight from the device-resident immutable full ntf, indexed by this slot's
-    // global event index (order_2D_index), which is uploaded below (P12). That drops
-    // a 124 MB host buffer, its 31M-write copy, and a 124 MB H2D upload per iteration.
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < n_workers * num_steps; i++) {
         int idx = order_2D_index[i];
         if (valid_mask[i]) {
-            int orig_product = h_event_products[idx];
-            int pid = product_ids_within_worker[orig_product];
-            ev2d_product[i] = pid;
-            ev2d_quantity[i] = h_event_quantities[idx] * valid_mask[i];
-            int w = i / num_steps;
-            float* dst = &worker_inv[(size_t)(w * max_ppw + pid) * np1];
-            const float* src = &h_inventory[(size_t)orig_product * np1];
-            for (int n = 0; n < np1; n++) dst[n] = src[n];
+            ev2d_product[i] = h_event_products[idx];   // original product id (P13)
+            ev2d_quantity[i] = h_event_quantities[idx];
         } else {
             ev2d_product[i] = 0;
             ev2d_quantity[i] = 0;
@@ -504,12 +485,14 @@ static void iterate_core(
     }
 
     // --- Step 3: Upload kernel inputs and launch (reusing persistent buffers) ---
-    size_t inv_bytes = (size_t)n_workers * max_ppw * np1 * sizeof(float);
     size_t ev_count = ctx.ev_count;
 
     if (prof.on) { prof.prep += prof_now() - tp; tp = prof_now(); }
 
-    CUDA_CHECK(cudaMemcpy(ctx.d_worker_inv, worker_inv.data(), inv_bytes, cudaMemcpyHostToDevice));
+    // Upload a fresh copy of the authoritative inventory (70 MB) for the kernel to
+    // mutate as per-iteration scratch (P13) — replaces the 124 MB worker_inv reshape.
+    CUDA_CHECK(cudaMemcpy(ctx.d_inv_scratch, h_inventory.data(),
+                          (size_t)n_products * np1 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_ev_product, ev2d_product.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_ev_quantity, ev2d_quantity.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
     // P12: upload the per-slot global event index (4 MB) instead of the per-window
@@ -533,7 +516,7 @@ static void iterate_core(
     if (legacy_kernel) {
         simulate_worker_kernel<<<n_workers, 1>>>(
             nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
-            ctx.d_worker_inv, algo_state.capacity,
+            ctx.d_inv_scratch, algo_state.capacity,
             ctx.d_ev_product, ctx.d_ev_quantity,
             ctx.d_event_ntf_full, ctx.d_order_2D_index, ctx.d_cap_delta,
             ctx.d_valid_mask, ctx.d_worker_keys,
@@ -544,7 +527,7 @@ static void iterate_core(
         int blocks = (n_workers + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         simulate_worker_kernel_warp<<<blocks, WARPS_PER_BLOCK * 32>>>(
             nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
-            ctx.d_worker_inv, algo_state.capacity,
+            ctx.d_inv_scratch, algo_state.capacity,
             ctx.d_ev_product, ctx.d_ev_quantity,
             ctx.d_event_ntf_full, ctx.d_order_2D_index, ctx.d_cap_delta,
             ctx.d_valid_mask, ctx.d_worker_keys,

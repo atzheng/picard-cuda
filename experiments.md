@@ -152,6 +152,7 @@ GPU-port prep).
 | E4 (#9 post)          | 1.09 s | 104.2× |
 | E5 (#10 P5b prep scan) | 0.870 s | 130.2× |
 | E6 (#11 init + #12 ntf elim) | 0.756 s | 149.8× |
+| E7 (#13 inventory scratch) | 0.712 s | 159.1× |
 
 ---
 
@@ -207,3 +208,29 @@ iterations the wall is ~half one-time setup (D2H state + first-touch faulting of
 remaining scratch) and ~half the 4-iteration loop. Faulting can't be sped up here (no
 huge pages), so further wins must shrink the footprint (P13: `worker_inv`) or the loop
 (P9: GPU prep). See `OPTIMIZATIONS.md` "Next steps".
+
+---
+
+## E7 — Same workload after the full-inventory device scratch (#13)
+
+- **Commit:** _(this commit)_ — `worker_inv` (the per-worker private inventory,
+  124 MB) is replaced by a single full-inventory device scratch (70 MB) re-seeded
+  from `h_inventory` each iteration. Products are partitioned 1:1 to workers, so the
+  kernel indexes the shared scratch by original product id with no cross-worker race.
+  See `OPTIMIZATIONS.md` §13.
+- **Correctness:** **bit-identical** — `LEGACY_KERNEL=1` 0/1,000,000 vs. sequential
+  (4 iters, conflicts 1); warp kernel 0/1,000,000; sub100k C and A 0 mismatches.
+
+| Mode | Configuration | Wall time | Detail |
+|------|---------------|----------:|--------|
+| Sequential | single-thread scan | 113.25 s | unchanged |
+| Parallel (Picard, warp kernel) | 10,000 workers × 100 steps/worker | **0.712 s** | 4 iterations, 1 conflict |
+
+**Speedup: 159.1×** (113.25 s → 0.712 s) — up from 149.8× (E6). #13 cut reshape
+5.6 → 2.1 ms/iter and H2D 17.5 → 13.2 ms/iter (124 → 70 MB upload), and removed the
+124 MB host buffer (less first-touch faulting).
+
+**Phase profile (`PROFILE=1`):** kernel 28.7 ms (16.3%), H2D 13.2 ms (7.5%), post
+9.4 ms (5.3%), D2H 0.9 ms; the rest is prep (compute + one-time iter-1 faulting). The
+big per-window H2D buffers are gone except `cap_delta` (124 MB); the next lever is
+GPU-porting prep (P9). See `OPTIMIZATIONS.md` "Next steps".

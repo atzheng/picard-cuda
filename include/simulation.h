@@ -32,11 +32,14 @@ __global__ void simulate_worker_kernel(
     const int* nn_layer_sizes,
     int nn_num_layers,
     float greedy_cost_prob,
-    // Worker state
-    float* worker_inventory,    // [n_workers, max_ppw, n_nodes_plus1]
+    // Worker state. inventory_scratch is the full [n_products, n_nodes_plus1]
+    // inventory (a fresh per-iteration copy). Products are partitioned 1:1 to
+    // workers, so each worker only ever touches rows for its own products — the
+    // writes are disjoint across workers, no per-worker private copy needed (P13).
+    float* inventory_scratch,   // [n_products, n_nodes_plus1]
     const float* init_capacity, // [n_nodes_plus1]
     // Events for this iteration
-    const int* events_product,           // [n_workers, num_steps]
+    const int* events_product,           // [n_workers, num_steps] — original product id
     const int* events_quantity,          // [n_workers, num_steps]
     const int* event_ntf_full,           // [n_events, n_nodes_plus1] — immutable, device-resident
     const int* order_2D_index,           // [n_workers, num_steps] — global event idx per slot (-1 if none)
@@ -70,8 +73,6 @@ __global__ void simulate_worker_kernel(
 
     uint64_t key = rng_keys[worker_id];
 
-    float* inv = worker_inventory + (size_t)worker_id * max_ppw * n_nodes_plus1;
-
     for (int step = 0; step < num_steps; step++) {
         int flat_idx = worker_id * num_steps + step;
 
@@ -92,8 +93,8 @@ __global__ void simulate_worker_kernel(
         // index (valid here: the !valid_mask branch above already `continue`d).
         const int* node_ntf = event_ntf_full + (size_t)order_2D_index[flat_idx] * n_nodes_plus1;
 
-        // Inventory row for this product within this worker
-        float* inv_row = inv + (size_t)product * n_nodes_plus1;
+        // Inventory row for this product (rows are disjoint across workers).
+        float* inv_row = inventory_scratch + (size_t)product * n_nodes_plus1;
 
         // Split key
         uint64_t subkey;
@@ -142,9 +143,9 @@ __global__ void simulate_worker_kernel_warp(
     const int* nn_layer_sizes,
     int nn_num_layers,
     float greedy_cost_prob,
-    float* worker_inventory,
+    float* inventory_scratch,            // [n_products, n_nodes_plus1] — disjoint rows per worker (P13)
     const float* init_capacity,
-    const int* events_product,
+    const int* events_product,           // original product id per slot
     const int* events_quantity,
     const int* event_ntf_full,           // [n_events, n_nodes_plus1] — immutable, device-resident
     const int* order_2D_index,           // [n_workers, num_steps] — global event idx per slot
@@ -174,7 +175,6 @@ __global__ void simulate_worker_kernel_warp(
     __syncwarp();
 
     uint64_t key = rng_keys[worker_id];
-    float* inv = worker_inventory + (size_t)worker_id * max_ppw * n_nodes_plus1;
 
     const int in_size  = nn_layer_sizes[0];
     const int out_size = nn_layer_sizes[nn_num_layers];
@@ -196,7 +196,7 @@ __global__ void simulate_worker_kernel_warp(
         // Index the immutable, device-resident full ntf by this slot's global event
         // index (valid here: the !valid_mask branch above already `continue`d).
         const int* node_ntf = event_ntf_full + (size_t)order_2D_index[flat_idx] * n_nodes_plus1;
-        float* inv_row = inv + (size_t)product * n_nodes_plus1;
+        float* inv_row = inventory_scratch + (size_t)product * n_nodes_plus1;
 
         uint64_t subkey;
         split_key(key, key, subkey);                 // identical on every lane
