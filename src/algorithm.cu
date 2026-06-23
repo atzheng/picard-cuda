@@ -506,15 +506,31 @@ static void iterate_core(
 
     if (prof.on) { prof.h2d += prof_now() - tp; tp = prof_now(); }
 
-    // Launch kernel: one block per worker, 1 thread per block (sequential scan)
-    simulate_worker_kernel<<<n_workers, 1>>>(
-        nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
-        ctx.d_worker_inv, algo_state.capacity,
-        ctx.d_ev_product, ctx.d_ev_quantity, ctx.d_ev_ntf, ctx.d_cap_delta,
-        ctx.d_valid_mask, ctx.d_worker_keys,
-        n_workers, num_steps, max_ppw, np1,
-        ctx.d_fulfill_2D
-    );
+    // Launch the fulfillment kernel. Default: warp-cooperative (P8) — one warp per
+    // worker, parallelizing the per-event MLP across lanes. Set LEGACY_KERNEL=1 to
+    // use the original one-thread-per-worker scan (bit-identical reference).
+    static const bool legacy_kernel = (getenv("LEGACY_KERNEL") != nullptr);
+    if (legacy_kernel) {
+        simulate_worker_kernel<<<n_workers, 1>>>(
+            nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
+            ctx.d_worker_inv, algo_state.capacity,
+            ctx.d_ev_product, ctx.d_ev_quantity, ctx.d_ev_ntf, ctx.d_cap_delta,
+            ctx.d_valid_mask, ctx.d_worker_keys,
+            n_workers, num_steps, max_ppw, np1,
+            ctx.d_fulfill_2D
+        );
+    } else {
+        int blocks = (n_workers + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        simulate_worker_kernel_warp<<<blocks, WARPS_PER_BLOCK * 32>>>(
+            nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
+            ctx.d_worker_inv, algo_state.capacity,
+            ctx.d_ev_product, ctx.d_ev_quantity, ctx.d_ev_ntf, ctx.d_cap_delta,
+            ctx.d_valid_mask, ctx.d_worker_keys,
+            n_workers, num_steps, max_ppw, np1,
+            ctx.d_fulfill_2D
+        );
+    }
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     if (prof.on) { prof.kernel += prof_now() - tp; tp = prof_now(); }

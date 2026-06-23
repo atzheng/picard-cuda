@@ -90,3 +90,30 @@ optimizations alone took the parallel run **3.18 s → 1.77 s (1.8×)**.
 fell from 491 → 120 ms/iter; the **kernel is now the dominant phase** (its absolute
 cost is unchanged — the host work around it shrank). Next targets in
 `OPTIMIZATIONS.md` → "Next steps" (P8 warp kernel, P-post, P9 GPU prep).
+
+---
+
+## E3 — Same workload after the warp-cooperative kernel (#8)
+
+- **Commit:** _(this commit)_ — `simulate_worker_kernel_warp`: one warp per worker,
+  MLP matvec split across lanes, `logsumexp`/`norm` via warp shuffles. See
+  `OPTIMIZATIONS.md` §8.
+- **Oracle:** relaxed from bit-identical to **node-decision match rate** (the warp
+  reductions reorder float adds). `LEGACY_KERNEL=1` restores the scalar kernel.
+
+| Mode | Configuration | Wall time | Detail |
+|------|---------------|----------:|--------|
+| Sequential | single-thread scan | 113.25 s | unchanged |
+| Parallel (Picard, warp kernel) | 10,000 workers × 100 steps/worker | **1.37 s** | 4 iterations, 1 conflict |
+
+**Speedup: 82.8×** (113.25 s → 1.37 s) — up from 64.1× (E2). The kernel phase fell
+**152.8 → 29.1 ms/iter (5.2×)**.
+
+**Correctness (tolerance):** despite non-bit-identical floats, **0 / 1,000,000
+node-decision mismatches (100% match)**, iteration count unchanged — the NN enters
+only through a `roundf`'d infinitesimal tie-breaker, so last-bit differences are
+quantized away. sub100k Config C and A also 0/100,000.
+
+**Phase profile (`PROFILE=1`):** prep 129.1 ms (52.0%), post 67.0 ms (27.0%),
+kernel 29.1 ms (11.7%), H2D 22.7 ms (9.2%). Host prep + post are again the
+bottleneck (79%); see `OPTIMIZATIONS.md` "Next steps" (P-post, P5b, P9).

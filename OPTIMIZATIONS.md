@@ -36,7 +36,8 @@ All numbers best-of-3, measured together in a single run for consistency.
 | 1 | State-resident host loop   | 0.372 s | 0.252 s | 1.40× | 1.40× |
 | 2 | Window-scoped inventory reshape | 0.303 s | 0.236 s | 1.23× | 1.72× |
 | 3 | Window-scoped conflict/commit   | 0.296 s | 0.232 s | 1.02× | 1.76× |
-| 4–7 | O(n) cum_count + persistent buffers + get_slice copies + OpenMP | 0.247 s | 0.200 s | 1.20× | **2.11×** |
+| 4–7 | O(n) cum_count + persistent buffers + get_slice copies + OpenMP | 0.247 s | 0.200 s | 1.20× | 2.11× |
+| 8 | Warp-cooperative kernel (tolerance oracle) | 0.160 s | 0.113 s | 1.54× | **3.26×** |
 
 (#4–#7 were driven by the **1M-event** workload where `prep` dominates — see the
 "Scaling to 1,000,000 events" section below for the per-step phase breakdown; the
@@ -242,29 +243,61 @@ H2D upload      6.3%    22.7 ms/iter
 D2H readback    0.1%     0.3 ms/iter
 ```
 
+### 8. Warp-cooperative kernel (one warp per worker)
+
+**Diagnosis.** The kernel was launched `<<<n_workers, 1>>>` — one thread per block,
+so 31/32 of every warp's lanes were idle, and the per-event MLP matvec
+(`[30,64,64,31]`, ~12K multiply-adds) ran fully serial on that one lane. It was the
+top phase at 42.6% (152.8 ms/iter).
+
+**Change.** New `simulate_worker_kernel_warp`: **one warp (32 lanes) per worker**,
+8 warps/block. The step loop stays serial (inventory/capacity carry across steps),
+but within each event: the MLP layer outputs are split across lanes (each lane does
+its own output's serial inner dot — same summation order as before), and the
+`logsumexp` + `norm` reductions use warp shuffles. Per-worker state (`capacity`,
+NN ping-pong scratch) lives in shared memory; the feasibility scan is a cheap
+serial step on lane 0. Selected at launch; `LEGACY_KERNEL=1` restores the scalar
+kernel.
+
+**Correctness — tolerance, not bit-identical.** The warp reductions sum floats in a
+different order, so outputs are not bit-identical. The oracle is relaxed to
+**node-decision match rate** vs. the sequential scan. In practice the NN only
+enters the decision through `roundf(1e-7 · out/‖out‖)` — an infinitesimal
+tie-breaker rounded to an integer — so the last-bit differences are quantized away:
+**measured 0/1,000,000 mismatches (100% match), iteration count unchanged**, and
+0/100,000 on sub100k Config C and A. Decision-identical here even though not
+bit-identical.
+
+**Result.** kernel **152.8 → 29.1 ms/iter (5.2×)**; 1M wall 1.77 → **1.37 s**.
+Cumulative vs. sequential: 113.25 s → 1.37 s = **82.8×**.
+
+**Profile after (1M, `PROFILE=1`):**
+```
+prep (CPU)     52.0%   129.1 ms/iter   <-- host prep dominant again
+post (CPU)     27.0%    67.0 ms/iter   (the 1M-element std::sort — see P-post)
+kernel         11.7%    29.1 ms/iter
+H2D upload      9.2%    22.7 ms/iter
+D2H readback    0.1%     0.3 ms/iter
+```
+
 ---
 
 ## Next steps (diagnosed, not yet implemented)
 
-P4–P7 are **done** (see #4–#7 above). After them the 1M profile is:
+P4–P8 are **done** (see #4–#8 above). After them the 1M profile is:
 
 ```
-kernel         42.6%   152.8 ms/iter   <-- now the top phase (unchanged in abs.)
-prep (CPU)     33.3%   119.7 ms/iter
-post (CPU)     17.7%    63.5 ms/iter
-H2D upload      6.3%    22.7 ms/iter
+prep (CPU)     52.0%   129.1 ms/iter   <-- host prep dominant again
+post (CPU)     27.0%    67.0 ms/iter   (the 1M-element std::sort — see P-post)
+kernel         11.7%    29.1 ms/iter
+H2D upload      9.2%    22.7 ms/iter
 D2H readback    0.1%     0.3 ms/iter
 ```
 
-### P8 — Warp-parallel kernel (now the top phase, 42.6%)
-Launched `<<<n_workers, 1>>>` — one thread per block, so 31/32 of each warp is idle
-and the per-event NN inference runs fully serial. A warp-per-worker design
-parallelizes the per-event matvec/feasibility scan. **Caveat:** changes the NN's
-floating-point reduction order → breaks the *bit-identical* oracle; needs a
-tolerance-based oracle or a fixed reduction order first. Highest payoff now,
-highest care. **Needs a product decision on the oracle before starting.**
+With the kernel down to 11.7%, **host prep + post are again the bottleneck (79%)**.
+Remaining targets, in priority order:
 
-### P-post — Drop the 1M-element `std::sort` in `post` (17.7%)
+### P-post — Drop the 1M-element `std::sort` in `post` (now 27%)
 `post` is now dominated by sorting `order_flat` (all `n_workers·num_steps` global
 indices) every iteration just to find `max_t_reset` — the same "needless sort"
 pattern P4 removed from prep. Event 0 always maps to `t_reset`, so the contiguous
@@ -272,22 +305,21 @@ run starts there; an `O(window)` "present" bitmap over `[t_reset, t_reset+eff)` 
 a first-gap scan replaces the `O(window log window)` sort. Integer; must reproduce
 `max_t_reset` exactly — verify against the sort on the trajectory before trusting.
 
-### P5b — OpenMP / parallel-scan the `compute_capacity_delta` cumsum
-The serial prefix scan is the remaining un-parallelized chunk of prep. A
-blocked parallel scan would speed it up but reorders float adds (bit-identicality
-risk); gated on the same oracle decision as P8.
+### P5b — Parallelize the remaining serial prep (now 52%)
+The un-parallelized chunks of prep are the `compute_capacity_delta` cumsum prefix
+scan (a blocked parallel scan reorders float adds — now acceptable under the
+tolerance oracle) and the serial Fisher–Yates shuffle in `random_assignment`.
 
 ### P9 — Move prep onto the GPU (architectural, highest ceiling)
-prep is still 33% of runtime and is pure array transforms (gather/scatter,
+prep is still ~52% of runtime and is pure array transforms (gather/scatter,
 counting, cumsum) on data already bound for the device. Porting it to CUDA removes
-the CPU from the hot path entirely. Largest effort; cumsum carries the same
-float-order risk as P5b.
+the CPU from the hot path entirely. Largest effort.
 
 ### Projected trajectory (1M-event wall clock)
 | Step | wall | note |
 |------|-----:|------|
 | `54dcf3e` (#1–#3) | 3.16 s | starting point |
-| **+#4–#7 (done)** | **1.77 s** | **bit-identical, 64.1× vs sequential** |
-| +P-post | ~1.5 s | bit-identical (verify max_t_reset) |
-| +P8 (kernel) | ~1.0 s | needs oracle change |
-| +P9 (GPU prep) | well under 1 s | architectural |
+| +#4–#7 | 1.77 s | bit-identical, 64.1× vs sequential |
+| **+#8 warp kernel (done)** | **1.37 s** | **tolerance oracle (0 mismatches), 82.8×** |
+| +P-post | ~1.2 s | drop the post-phase sort |
+| +P5b / P9 (GPU prep) | well under 1 s | architectural |
