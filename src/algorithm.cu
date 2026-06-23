@@ -220,7 +220,8 @@ struct IterContext {
     std::vector<float> capacity_delta;
     std::vector<int> ev2d_product, ev2d_quantity, ev2d_ntf;
     std::vector<uint64_t> worker_keys;
-    std::vector<int> fulfill_2D, order_flat;
+    std::vector<int> fulfill_2D;
+    std::vector<unsigned char> present;  // window presence bitmap for max_t_reset
 
     // Persistent device scratch (allocated once, reused each iteration).
     float* d_worker_inv = nullptr;
@@ -300,7 +301,7 @@ static void init_iter_context(
     ctx.ev2d_ntf.resize(evc * np1);
     ctx.worker_keys.resize(ctx.n_workers);
     ctx.fulfill_2D.resize(evc);
-    ctx.order_flat.resize(evc);
+    ctx.present.resize(ens);
 
     // Per-iteration buffer sizes depend only on config dims, so allocate once.
     size_t inv_bytes = (size_t)ctx.n_workers * ctx.max_ppw * np1 * sizeof(float);
@@ -541,29 +542,24 @@ static void iterate_core(
 
     if (prof.on) { prof.d2h += prof_now() - tp; tp = prof_now(); }
 
-    // --- Step 4: Compute max_t_reset from contiguity of order_2D_index ---
-    // (order_flat is window-sized: n_workers * num_steps entries.)
-    std::vector<int>& order_flat = ctx.order_flat;
-    std::copy(order_2D_index.begin(), order_2D_index.end(), order_flat.begin());
-    std::sort(order_flat.begin(), order_flat.end());
-
-    int max_t_reset = n_events;
-    for (int i = 1; i < (int)order_flat.size(); i++) {
-        if (order_flat[i - 1] >= 0 && order_flat[i] - order_flat[i - 1] > 1) {
-            max_t_reset = order_flat[i - 1] + 1;
-            break;
-        }
+    // --- Step 4: max_t_reset = end of the contiguous run of assigned global
+    //     indices starting at t_reset (P-post). Each assigned 2D slot holds a
+    //     distinct global index t_reset+i with i in [0, eff_num_steps); event 0
+    //     always lands at t_reset, so the run starts there and max_t_reset is just
+    //     t_reset + (run length). Mark presence over the window and find the first
+    //     hole — O(window) — replacing the previous O(window log window) sort.
+    //     This reproduces the sort-based value exactly (the first gap among the
+    //     sorted assigned indices is the first missing offset above the run).
+    std::vector<unsigned char>& present = ctx.present;
+    std::fill(present.begin(), present.begin() + eff_num_steps, (unsigned char)0);
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n_workers * num_steps; i++) {
+        int g = order_2D_index[i];
+        if (g >= 0) present[g - algo_state.t_reset] = 1;  // offset in [0, eff)
     }
-    // Also check if we never found a gap
-    if (max_t_reset == n_events && !order_flat.empty()) {
-        // Find the last valid index
-        for (int i = (int)order_flat.size() - 1; i >= 0; i--) {
-            if (order_flat[i] >= 0) {
-                max_t_reset = order_flat[i] + 1;
-                break;
-            }
-        }
-    }
+    int run = 0;
+    while (run < eff_num_steps && present[run]) run++;
+    int max_t_reset = algo_state.t_reset + run;
 
     // --- Step 5: Conflict detection (window-scoped) ---
     // The new fulfillment differs from the committed one only at assigned window

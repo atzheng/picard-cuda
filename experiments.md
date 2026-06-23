@@ -117,3 +117,36 @@ quantized away. sub100k Config C and A also 0/100,000.
 **Phase profile (`PROFILE=1`):** prep 129.1 ms (52.0%), post 67.0 ms (27.0%),
 kernel 29.1 ms (11.7%), H2D 22.7 ms (9.2%). Host prep + post are again the
 bottleneck (79%); see `OPTIMIZATIONS.md` "Next steps" (P-post, P5b, P9).
+
+---
+
+## E4 — Same workload after the O(window) post phase (#9)
+
+- **Commit:** _(this commit)_ — replace the post-phase `std::sort` of 1M indices
+  with an O(window) presence-mark + first-hole scan for `max_t_reset`. See
+  `OPTIMIZATIONS.md` §9.
+- **Correctness:** `max_t_reset` is reproduced **exactly**. Cross-checked with the
+  bit-identical scalar kernel (`LEGACY_KERNEL=1`): Picard+#9 is **0/1,000,000
+  mismatches** vs. sequential with iteration count/conflicts unchanged, so #9 does
+  not perturb the trajectory. Default warp kernel: 0/1,000,000.
+
+| Mode | Configuration | Wall time | Detail |
+|------|---------------|----------:|--------|
+| Sequential | single-thread scan | 113.25 s | unchanged |
+| Parallel (Picard, warp kernel) | 10,000 workers × 100 steps/worker | **1.09 s** | 4 iterations, 1 conflict |
+
+**Speedup: 104.2×** (113.25 s → 1.09 s) — up from 82.8× (E3); crosses 100×. The
+post phase fell **67.0 → 11.1 ms/iter (6×)**.
+
+**Phase profile (`PROFILE=1`):** prep 120.5 ms (65.5%), kernel 29.2 ms (15.9%),
+H2D 23.0 ms (12.5%), post 11.1 ms (6.0%). **Host prep is now the lone bottleneck at
+65.5%**; next targets in `OPTIMIZATIONS.md` "Next steps" (P5b parallelize prep, P9
+GPU-port prep).
+
+### Cumulative speedup vs. sequential (1M events)
+| Stage | Wall | Speedup |
+|-------|-----:|--------:|
+| E1 (`54dcf3e`, #1–#3) | 3.18 s | 35.6× |
+| E2 (#4–#7 host prep)  | 1.77 s | 64.1× |
+| E3 (#8 warp kernel)   | 1.37 s | 82.8× |
+| **E4 (#9 post)**      | **1.09 s** | **104.2×** |

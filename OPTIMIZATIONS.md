@@ -37,7 +37,8 @@ All numbers best-of-3, measured together in a single run for consistency.
 | 2 | Window-scoped inventory reshape | 0.303 s | 0.236 s | 1.23× | 1.72× |
 | 3 | Window-scoped conflict/commit   | 0.296 s | 0.232 s | 1.02× | 1.76× |
 | 4–7 | O(n) cum_count + persistent buffers + get_slice copies + OpenMP | 0.247 s | 0.200 s | 1.20× | 2.11× |
-| 8 | Warp-cooperative kernel (tolerance oracle) | 0.160 s | 0.113 s | 1.54× | **3.26×** |
+| 8 | Warp-cooperative kernel (tolerance oracle) | 0.160 s | 0.113 s | 1.54× | 3.26× |
+| 9 | O(window) max_t_reset (drop post sort) | 0.144 s | 0.100 s | 1.12× | **3.62×** |
 
 (#4–#7 were driven by the **1M-event** workload where `prep` dominates — see the
 "Scaling to 1,000,000 events" section below for the per-step phase breakdown; the
@@ -280,6 +281,35 @@ H2D upload      9.2%    22.7 ms/iter
 D2H readback    0.1%     0.3 ms/iter
 ```
 
+### 9. O(window) `max_t_reset` (drop the post-phase sort)
+
+**Diagnosis.** With the kernel cut by #8, `post` became 27% — almost entirely a
+`std::sort` of all `n_workers·num_steps` (1M) entries of `order_2D_index` every
+iteration, just to find `max_t_reset` (the end of the contiguous run of resolved
+events). Same needless-sort pattern #4 removed from prep.
+
+**Change.** Each assigned 2D slot holds a *distinct* global index `t_reset + i`
+(`i ∈ [0, eff)`), and event 0 always lands at `t_reset`, so the run starts there
+and `max_t_reset = t_reset + (run length)`. Mark a window-sized presence bitmap and
+scan for the first hole — `O(window)` instead of `O(window log window)`. The first
+hole above the run is exactly the first gap among the sorted assigned indices, so
+the result is **identical to the sort** (verified: with the bit-identical
+`LEGACY_KERNEL` scalar kernel, Picard+#9 is **0/1,000,000 mismatches** vs.
+sequential and the iteration count/conflicts are unchanged — #9 doesn't perturb the
+trajectory at all).
+
+**Result.** post **67.0 → 11.1 ms/iter (6×)**; 1M wall 1.37 → **1.09 s**.
+Cumulative vs. sequential: 113.25 s → 1.09 s = **104.2×**.
+
+**Profile after (1M, `PROFILE=1`):**
+```
+prep (CPU)     65.5%   120.5 ms/iter   <-- host prep is the bottleneck
+kernel         15.9%    29.2 ms/iter
+H2D upload     12.5%    23.0 ms/iter
+post (CPU)      6.0%    11.1 ms/iter
+D2H readback    0.2%     0.3 ms/iter
+```
+
 ---
 
 ## Next steps (diagnosed, not yet implemented)
@@ -287,39 +317,40 @@ D2H readback    0.1%     0.3 ms/iter
 P4–P8 are **done** (see #4–#8 above). After them the 1M profile is:
 
 ```
-prep (CPU)     52.0%   129.1 ms/iter   <-- host prep dominant again
-post (CPU)     27.0%    67.0 ms/iter   (the 1M-element std::sort — see P-post)
-kernel         11.7%    29.1 ms/iter
-H2D upload      9.2%    22.7 ms/iter
-D2H readback    0.1%     0.3 ms/iter
+prep (CPU)     65.5%   120.5 ms/iter   <-- host prep is the bottleneck
+kernel         15.9%    29.2 ms/iter
+H2D upload     12.5%    23.0 ms/iter
+post (CPU)      6.0%    11.1 ms/iter
+D2H readback    0.2%     0.3 ms/iter
 ```
 
-With the kernel down to 11.7%, **host prep + post are again the bottleneck (79%)**.
-Remaining targets, in priority order:
+P4–P8 and P-post (#9) are **done**. With the kernel at 15.9% and post at 6.0%,
+**host prep is now 65.5%** — the clear remaining bottleneck. Targets in priority
+order:
 
-### P-post — Drop the 1M-element `std::sort` in `post` (now 27%)
-`post` is now dominated by sorting `order_flat` (all `n_workers·num_steps` global
-indices) every iteration just to find `max_t_reset` — the same "needless sort"
-pattern P4 removed from prep. Event 0 always maps to `t_reset`, so the contiguous
-run starts there; an `O(window)` "present" bitmap over `[t_reset, t_reset+eff)` +
-a first-gap scan replaces the `O(window log window)` sort. Integer; must reproduce
-`max_t_reset` exactly — verify against the sort on the trajectory before trusting.
-
-### P5b — Parallelize the remaining serial prep (now 52%)
-The un-parallelized chunks of prep are the `compute_capacity_delta` cumsum prefix
-scan (a blocked parallel scan reorders float adds — now acceptable under the
-tolerance oracle) and the serial Fisher–Yates shuffle in `random_assignment`.
+### P5b — Parallelize the remaining serial prep (the 65.5%)
+prep's `reshape`/event-build and `compute_capacity_delta` gather are already
+OpenMP'd; the un-parallelized chunks left are the `compute_capacity_delta` cumsum
+**prefix scan** (a blocked parallel scan reorders float adds — now acceptable under
+the tolerance oracle) and the serial **Fisher–Yates shuffle** in
+`random_assignment` (`O(n_products)`; parallelizable with a different permutation
+algorithm, though that changes the worker assignment and so must be re-validated
+against the decision tolerance).
 
 ### P9 — Move prep onto the GPU (architectural, highest ceiling)
-prep is still ~52% of runtime and is pure array transforms (gather/scatter,
-counting, cumsum) on data already bound for the device. Porting it to CUDA removes
-the CPU from the hot path entirely. Largest effort.
+prep is ~66% of runtime and is pure array transforms (gather/scatter, counting,
+cumsum) on data already bound for the device. Porting it to CUDA removes the CPU
+from the hot path entirely. Largest effort.
+
+### H2D (12.5%) — compact/pinned `worker_inv` upload
+The 12.7 MB `worker_inv` upload per iteration is mostly dead rows; a compact
+per-window layout or pinned host memory shrinks it.
 
 ### Projected trajectory (1M-event wall clock)
 | Step | wall | note |
 |------|-----:|------|
 | `54dcf3e` (#1–#3) | 3.16 s | starting point |
 | +#4–#7 | 1.77 s | bit-identical, 64.1× vs sequential |
-| **+#8 warp kernel (done)** | **1.37 s** | **tolerance oracle (0 mismatches), 82.8×** |
-| +P-post | ~1.2 s | drop the post-phase sort |
-| +P5b / P9 (GPU prep) | well under 1 s | architectural |
+| +#8 warp kernel | 1.37 s | tolerance oracle (0 mismatches), 82.8× |
+| **+#9 post O(window) (done)** | **1.09 s** | **exact; 104.2× vs sequential** |
+| +P5b / P9 (prep) | well under 1 s | parallelize / GPU-port prep |
