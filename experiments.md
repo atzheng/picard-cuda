@@ -1,0 +1,67 @@
+# Experiments log
+
+Benchmark runs of the fulfillment simulator: sequential single-thread scan vs.
+parallel Picard iteration on GPU. Each entry records the commit the binary was
+built from, the workload, the configuration, measured timings, and a correctness
+check (parallel must be bit-identical to sequential on the same data).
+
+**Hardware:** NVIDIA A100 80GB PCIe (driver 595.71.05), 24-core host CPU.
+
+---
+
+## E1 — Sequential vs. parallel at 1,000,000 events
+
+- **Commit:** `54dcf3e` (Initial commit: optimized Picard host loop)
+- **Workload:** `data/sub1m/npy` — first 1,000,000 events of the full dataset,
+  product ids remapped to a compact range. **567,323 distinct products, 30 nodes.**
+  Generated from `data/npy` (1M products × 30 nodes × 3M events).
+- **Seed:** 42 (deterministic iteration count / conflicts).
+- **Correctness oracle:** parallel fulfillment vs. sequential fulfillment,
+  compared with `np.array_equal`.
+
+| Mode | Configuration | Wall time | Detail |
+|------|---------------|----------:|--------|
+| Sequential | single-thread scan | **113.25 s** | 1,000,000 / 1,000,000 events |
+| Parallel (Picard) | 10,000 workers × 100 steps/worker | **3.18 s** | 4 iterations, 1 conflict |
+
+**Speedup: 35.6×** (113.25 s → 3.18 s).
+
+**Correctness:** bit-identical — 1,000,000 fulfillments, **0 mismatches**.
+
+**Observations:**
+- With `num_steps × n_workers = 100 × 10,000 = 1,000,000`, the processing window
+  spans the entire event horizon, so Picard converged in just **4 iterations**
+  (only 1 conflict to resolve across the whole horizon). Fewer, larger iterations
+  amortize per-iteration host overhead well.
+- This 35.6× is the end-to-end sequential-vs-parallel win at scale, where the
+  GPU's per-event parallelism dominates. It is a different measurement from the
+  ~1.76× host-orchestration gains in `OPTIMIZATIONS.md`, which isolate host
+  overhead on a deliberately host-heavy small-window config.
+
+**Reproduce:**
+```bash
+# build the 1M-event workload (first 1M events, compact product ids)
+python - <<'PY'
+import numpy as np, os
+src, dst = 'data/npy', 'data/sub1m/npy'; os.makedirs(dst, exist_ok=True)
+N = 1_000_000
+op   = np.load(src+'/order_products.npy')[:N]
+ninf = np.load(src+'/node_index_near_to_far.npy')[:N]
+inv  = np.load(src+'/inventory.npy'); cap = np.load(src+'/capacity.npy')
+uniq = np.unique(op)
+remap = np.full(inv.shape[0], -1, np.int64); remap[uniq] = np.arange(len(uniq))
+np.save(dst+'/order_products.npy', remap[op].astype(np.int32))
+np.save(dst+'/node_index_near_to_far.npy', ninf.astype(np.int32))
+np.save(dst+'/inventory.npy', inv[uniq].astype(inv.dtype))
+np.save(dst+'/capacity.npy', cap)
+PY
+
+./build/cuda_sim data/sub1m/npy --mode sequential --seed 42 \
+    --fulfill_output /tmp/seq1m_fulfill.npy
+./build/cuda_sim data/sub1m/npy --mode picard --seed 42 \
+    --max_workers 10000 --max_products_per_worker 100 --num_steps 100 \
+    --fulfill_output /tmp/par1m_fulfill.npy
+
+python -c "import numpy as np; a=np.load('/tmp/seq1m_fulfill.npy'); \
+b=np.load('/tmp/par1m_fulfill.npy'); print('identical:', np.array_equal(a,b))"
+```
