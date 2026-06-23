@@ -286,3 +286,63 @@ fulfillment kernel (~29 ms); prep 12.2 ms (9.5%), post 10.5 ms (8.2%), H2D 6.3 m
 cap_delta ~6; prep 10.7 ms (17.0%), post 9.9 ms (15.7%), H2D 6.5 ms (10.3%), D2H
 0.9 ms. The loop is balanced again — the fulfillment kernel is now the single biggest
 piece. See `OPTIMIZATIONS.md` "Next steps".
+
+---
+
+## E10 — Full 3,000,000-event workload + parallel parameter sweep
+
+- **Commit:** `ec6f9a7` (binary through #15, GPU `capacity_delta` + multi-block cumsum).
+- **Workload:** `data/sub3m/npy` — the **full 3,000,000 events**, product ids remapped
+  compact. **833,297 distinct products, 30 nodes.** Built from `data/npy` with the same
+  recipe as E1 but without the `[:N]` truncation.
+- **Seed:** 42. **Oracle:** parallel fulfillment vs. sequential, `np.array_equal`.
+
+### Sequential vs. parallel
+| Mode | Configuration | Wall time | Detail |
+|------|---------------|----------:|--------|
+| Sequential | single-thread scan | **342.21 s** | 3,000,000 / 3,000,000 events |
+| Parallel (natural) | 30,000 workers × 100 steps (window 3M) | **0.80 s** | 4 iterations, 2 conflicts |
+| **Parallel (tuned)** | ~30,000 workers × ~165 steps (window ~5M) | **0.63 s** | **2 iterations**, 0 conflicts |
+
+**Speedup: 428× (natural) → 541× (tuned)** (342.21 s → 0.80 / 0.63 s). All configs
+**bit-identical** to sequential — **0 / 3,000,000 mismatches** at every setting tried.
+
+### Parameter sweep (best-of-3/4 wall, all 0 mismatches)
+`window = workers × steps`; the event horizon is 3,000,000.
+
+| workers | steps | window | iters | wall |
+|--------:|------:|-------:|------:|-----:|
+| 30000 | 25  | 0.75M | 18 | 1.16 s |
+| 10000 | 100 | 1.0M  | 10 | 0.84 s |
+| 30000 | 50  | 1.5M  | 8  | 0.91 s |
+| 100000| 30  | 3.0M  | 6  | 1.03 s |
+| 60000 | 50  | 3.0M  | 5  | 0.88 s |
+| 30000 | 100 | 3.0M  | 4  | 0.80 s |
+| 30000 | 150 | 4.5M  | 3  | 0.71 s |
+| **30000** | **165** | **4.95M** | **2** | **0.63 s** |
+| 25000 | 200 | 5.0M  | 2  | 0.64 s |
+| 40000 | 135 | 5.4M  | 2  | 0.64 s |
+| 30000 | 200 | 6.0M  | 2  | 0.65 s |
+| 30000 | 250 | 7.5M  | 2  | 0.70 s |
+| 100000| 30  | 3.0M  | 6  | 1.03 s |
+
+### Best parameter settings — why
+**Iteration count dominates wall time** (each Picard iteration carries fixed
+prep/kernel/post/H2D overhead). Convergence to the sequential fixed point takes fewer
+iterations the larger the processing window `workers × steps` is relative to the event
+horizon:
+- **window ≥ ~1.65× horizon → 2 iterations** (the minimum: one pass to resolve, one to
+  confirm no conflict). This is the optimum.
+- window ≈ horizon → 3–4 iterations; window ≪ horizon → many (10–18) iterations,
+  each cheap but the per-iteration overhead piles up.
+- Past the 2-iteration threshold, a *larger* window only adds work per iteration
+  (kernel cost ∝ window) without removing iterations, so it gets slower again — hence
+  the **minimal 2-iteration window** (~1.65–1.8× horizon) is best.
+
+Worker count itself is not critical in the 25k–40k range (enough GPU parallelism;
+A100 holds ~7k resident warps, so these run in a few waves). Pushing workers very high
+with tiny steps (100k × 30) *adds* iterations and overhead and is worse.
+
+**Rule of thumb:** set `workers × steps ≈ 1.7 × n_events`, with `workers` ~10× the
+resident-warp capacity (≈ 30k on an A100), and `max_products_per_worker ≥
+n_products / workers`.
