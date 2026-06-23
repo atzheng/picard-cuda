@@ -301,21 +301,52 @@ __global__ void simulate_worker_kernel_warp(
 // result is **bit-identical** to the host version.
 
 // Per-column prefix sum: cumsum[t,n] = -count(s<=t : fulfill[s]==n) (×quantity).
-// One thread per node-column (np1 ≤ 64); the column scan stays serial in t so the
-// add order matches the host exactly, and the np1 writes at each t are contiguous
-// (coalesced). Launch <<<1, np1>>>.
+// One BLOCK per node-column (grid = np1); the block scans its column in chunks of
+// blockDim with a running carry, each chunk a parallel block-inclusive scan
+// (warp-shuffle scan + a serial scan over the per-warp totals). Integer partials, so
+// the result is exact regardless of the intra-chunk reduction order — bit-identical
+// to the host serial scan. blockDim must be a multiple of 32 (use 256). Launch
+// <<<np1, 256>>>.
 __global__ void capacity_cumsum_kernel(
     const int* __restrict__ fulfill,    // [eff]
     const int* __restrict__ quant,      // [eff]
     int eff, int np1,
     float* __restrict__ cumsum          // [eff, np1]
 ) {
-    int n = threadIdx.x;
+    const int n = blockIdx.x;
     if (n >= np1) return;
-    float acc = 0.0f;
-    for (int t = 0; t < eff; t++) {
-        if (fulfill[t] == n) acc -= (float)quant[t];
-        cumsum[(size_t)t * np1 + n] = acc;
+    const int T = blockDim.x;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = T >> 5;
+    __shared__ float wsum[32];   // per-warp totals
+    __shared__ float wexcl[32];  // exclusive prefix of the warp totals
+    __shared__ float carry_s;    // running column total across chunks
+    __shared__ float btot_s;     // this chunk's block total
+    if (threadIdx.x == 0) carry_s = 0.0f;
+    __syncthreads();
+
+    for (int base = 0; base < eff; base += T) {
+        int t = base + threadIdx.x;
+        float x = (t < eff && fulfill[t] == n) ? -(float)quant[t] : 0.0f;
+        // Warp-inclusive scan.
+        for (int o = 1; o < 32; o <<= 1) {
+            float y = __shfl_up_sync(0xffffffffu, x, o);
+            if (lane >= o) x += y;
+        }
+        if (lane == 31) wsum[warp] = x;
+        __syncthreads();
+        // Serial exclusive scan over the (≤32) per-warp totals.
+        if (threadIdx.x == 0) {
+            float acc = 0.0f;
+            for (int w = 0; w < nwarps; w++) { wexcl[w] = acc; acc += wsum[w]; }
+            btot_s = acc;
+        }
+        __syncthreads();
+        if (t < eff) cumsum[(size_t)t * np1 + n] = carry_s + x + wexcl[warp];
+        __syncthreads();
+        if (threadIdx.x == 0) carry_s += btot_s;
+        __syncthreads();
     }
 }
 

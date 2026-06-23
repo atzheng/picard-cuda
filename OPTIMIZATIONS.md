@@ -44,6 +44,7 @@ All numbers best-of-3, measured together in a single run for consistency.
 | 12 | Eliminate ev2d_ntf — kernel gathers device ntf | 0.141 s | 0.098 s | ~flat | 3.62× |
 | 13 | Replace worker_inv with full inventory scratch | 0.147 s | 0.093 s | ~flat | 3.62× |
 | 14 | GPU capacity_delta (P9 prep on device) | 0.112 s | 0.074 s | 1.31× | 4.74× |
+| 15 | Multi-block parallel cumsum | 0.094 s | 0.062 s | 1.19× | 5.62× |
 
 (#4–#7 and #10 were driven by the **1M-event** workload where `prep` dominates — see
 the "Scaling to 1,000,000 events" section below for the per-step phase breakdown; the
@@ -513,22 +514,52 @@ H2D upload      4.9%    6.3 ms/iter
 D2H readback    0.6%    0.7 ms/iter
 ```
 
+### 15. Multi-block parallel cumsum
+
+**Diagnosis.** #14's `capacity_cumsum_kernel` was `<<<1, np1>>>` — one block, np1
+threads, each latency-bound on a 1M-long serial scan of its column. It was ~70 ms/iter
+and almost the entire device `capacity_delta` cost (the "kernel" phase was 98.8 ms,
+of which only ~29 ms was the fulfillment kernel).
+
+**Change.** One **block per column** (grid = np1), each scanning its column in chunks
+of `blockDim` with a running carry; each chunk is a parallel block-inclusive scan
+(warp-shuffle scan + a serial scan over the ≤32 per-warp totals). Launch
+`<<<np1, 256>>>`. Integer partials ⇒ exact regardless of the intra-chunk reduction
+order, so still **bit-identical**: `LEGACY_KERNEL=1` 0/1,000,000 (4 iters, conflicts
+1); warp 0/1,000,000; sub100k C/A 0.
+
+**Result.** device `capacity_delta` **~70 → ~6 ms/iter** (kernel phase 98.8 →
+35.1 ms/iter, i.e. fulfillment ~29 + cap_delta ~6); 1M wall **0.555 → 0.301 s**.
+Cumulative vs. sequential: 113.25 s → 0.301 s = **376.2×**. sub100k C 0.112 → 0.094 s,
+A 0.074 → 0.062 s.
+
+**Profile after (1M, `PROFILE=1`):**
+```
+[init] D2H state    38 ms
+kernel         55.7%   35.1 ms/iter   (fulfillment ~29 + GPU cap_delta ~6)
+prep (CPU)     17.0%   10.7 ms/iter
+post (CPU)     15.7%    9.9 ms/iter
+H2D upload     10.3%    6.5 ms/iter
+D2H readback    1.4%    0.9 ms/iter
+```
+The loop is balanced again — the fulfillment kernel (~29 ms/iter) is the single
+biggest piece, with prep / post / H2D each ~7–11 ms.
+
 ---
 
 ## Next steps (diagnosed, not yet implemented)
 
-P4–P8, P5b (#10), init cleanup (#11), ntf elimination (#12), the inventory
-scratch (#13), and the first slice of P9 — GPU `capacity_delta` (#14) — are **done**.
-At 1M / 4 iterations the **wall is 0.555 s**, and the loop is now dominated by the
-device `capacity_delta` (~70 ms/iter, almost all the single-block cumsum). Host prep
-collapsed to ~12 ms/iter and H2D to ~6 ms. Remaining levers, in rough priority:
+P4–P8, P5b (#10), init (#11), ntf (#12), inventory scratch (#13), GPU
+`capacity_delta` (#14), and the parallel cumsum (#15) are **done**. At 1M / 4
+iterations the **wall is 0.301 s** and the loop is balanced: fulfillment kernel
+~29 ms/iter, then prep ~11, post ~10, H2D ~6, plus ~40 ms one-time init D2H. Remaining
+levers, in rough priority:
 
-### #15 — Multi-block parallel cumsum (immediate)
-The GPU `capacity_cumsum_kernel` is `<<<1, np1>>>` — one block, latency-bound on a
-1M-long serial scan per column, ~70 ms/iter and now the top cost. A standard
-two-level (scan-then-propagate) multi-block scan, or per-column block-scan with
-carry, parallelizes it across SMs. Still exact (integer partials). Highest immediate
-return.
+### Fulfillment kernel (~29 ms/iter, now the biggest)
+The warp kernel is one warp per worker, serial over `num_steps`. Further gains would
+come from better occupancy / instruction-level work (e.g. the per-event MLP), or
+overlapping the GPU `capacity_delta` with H2D via streams. Diminishing but it is now
+the top single cost.
 
 ### P9 (rest) — move the remaining prep onto the GPU
 With `capacity_delta` on-device, the remaining host prep (get_slice, worker mapping,
@@ -562,5 +593,5 @@ re-validated against the decision tolerance.
 | +#11 init no-init scratch | 0.870 s | wall-neutral (faulting floor) |
 | +#12 eliminate ev2d_ntf | 0.756 s | exact; 149.8× vs sequential |
 | +#13 inventory scratch | 0.712 s | exact; 159.1× vs sequential |
-| **+#14 GPU capacity_delta (done)** | **0.555 s** | **exact; 204.1× vs sequential** |
-| +#15 multi-block cumsum | toward 0.45 s | parallelize the single-block scan |
+| +#14 GPU capacity_delta | 0.555 s | exact; 204.1× vs sequential |
+| **+#15 multi-block cumsum (done)** | **0.301 s** | **exact; 376.2× vs sequential** |

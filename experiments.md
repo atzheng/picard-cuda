@@ -154,6 +154,7 @@ GPU-port prep).
 | E6 (#11 init + #12 ntf elim) | 0.756 s | 149.8× |
 | E7 (#13 inventory scratch) | 0.712 s | 159.1× |
 | E8 (#14 GPU capacity_delta) | 0.555 s | 204.1× |
+| E9 (#15 multi-block cumsum) | 0.301 s | 376.2× |
 
 ---
 
@@ -261,3 +262,27 @@ prep collapsed **124 → 12 ms/iter**, H2D **13.2 → 6.3 ms/iter**.
 fulfillment kernel (~29 ms); prep 12.2 ms (9.5%), post 10.5 ms (8.2%), H2D 6.3 ms
 (4.9%). The single-block cumsum is the new bottleneck — a multi-block parallel scan
 (#15) is the next step. See `OPTIMIZATIONS.md` "Next steps".
+
+---
+
+## E9 — Same workload after the multi-block parallel cumsum (#15)
+
+- **Commit:** _(this commit)_ — `capacity_cumsum_kernel` changed from `<<<1, np1>>>`
+  (one latency-bound block) to one block per node-column (`<<<np1, 256>>>`), each a
+  chunked block-inclusive scan with a running carry. See `OPTIMIZATIONS.md` §15.
+- **Correctness — bit-identical** (integer partials, order-independent):
+  `LEGACY_KERNEL=1` **0/1,000,000** vs. sequential (4 iters, conflicts 1); warp kernel
+  0/1,000,000; sub100k C and A 0.
+
+| Mode | Configuration | Wall time | Detail |
+|------|---------------|----------:|--------|
+| Sequential | single-thread scan | 113.25 s | unchanged |
+| Parallel (Picard, warp kernel) | 10,000 workers × 100 steps/worker | **0.301 s** | 4 iterations, 1 conflict |
+
+**Speedup: 376.2×** (113.25 s → 0.301 s) — up from 204.1× (E8). The device
+`capacity_delta` fell ~70 → ~6 ms/iter (kernel phase 98.8 → 35.1 ms/iter).
+
+**Phase profile (`PROFILE=1`):** kernel 35.1 ms (55.7%) — fulfillment ~29 + GPU
+cap_delta ~6; prep 10.7 ms (17.0%), post 9.9 ms (15.7%), H2D 6.5 ms (10.3%), D2H
+0.9 ms. The loop is balanced again — the fulfillment kernel is now the single biggest
+piece. See `OPTIMIZATIONS.md` "Next steps".

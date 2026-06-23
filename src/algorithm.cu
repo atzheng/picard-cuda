@@ -525,7 +525,7 @@ static void iterate_core(
     // P9: produce capacity_delta on the device. The per-column cumsum (serial in t,
     // exact since quantities are integers) feeds a fully-parallel gather. Same stream
     // as the fulfillment kernel below, so it is ordered before the kernel reads it.
-    capacity_cumsum_kernel<<<1, np1>>>(
+    capacity_cumsum_kernel<<<np1, 256>>>(
         ctx.d_slice_fulfill, ctx.d_slice_quantities, eff_num_steps, np1, ctx.d_cumsum);
     {
         long total = (long)n_workers * num_steps * np1;
