@@ -173,21 +173,84 @@ post (CPU)      6.8%
 
 ## Next steps (diagnosed, not yet implemented)
 
-In descending order of remaining cost in Config C:
+### The bottleneck inverts at scale
 
-1. **Kernel (~42%).** Launched as `<<<n_workers, 1>>>` — **one thread per block**,
-   so 31/32 of each warp is idle and the NN inference per event runs fully serial.
-   A warp-per-worker design (template exists: `bench_dynamics_only_kernel_warp`)
-   would parallelize the per-event matvec/feasibility scan. **Caveat:** the
-   correctness oracle is *bit-identical* equality with the sequential scan;
-   parallelizing the NN's floating-point reductions changes summation order and
-   would break bit-identicality, so this needs either a tolerance-based oracle or a
-   fixed reduction order. Highest payoff, highest care.
-2. **prep non-reshape (~28%).** Dominated by `random_assignment` (a Fisher–Yates
-   shuffle over all 93,735 products every iteration) and `compute_capacity_delta`.
-   The shuffle is `O(n_products)` and unavoidable for identical results, but its
-   buffers can be made persistent, and the capacity-delta / cum_count work is a
-   candidate for OpenMP (24 cores idle).
-3. **H2D (~14%).** The `worker_inv` upload is 12.7 MB/iter but only ~10% of it
-   (the window rows) is live. Options: pinned host memory (faster copy) or a
-   compact per-window inventory layout (smaller copy).
+The Config-C "next steps" below were diagnosed on a deliberately host-heavy
+*small-window* config. At the **realistic 1M-event scale** (`data/sub1m/npy`,
+10,000 workers × 100 steps, 4 iterations — see `experiments.md` E1), the phase mix
+is completely different:
+
+```
+prep (CPU)     67.6%   491.3 ms/iter   <-- now totally dominant
+  of which reshape  10.1%  73.8 ms/iter
+kernel         21.0%   152.6 ms/iter
+post (CPU)      8.3%    60.7 ms/iter
+H2D upload      2.8%    20.5 ms/iter
+D2H readback    0.3%     2.1 ms/iter
+```
+
+**`prep` is 67.6% and it is single-threaded CPU work running while a 24-core host
+and an A100 sit idle.** That, not the kernel, is where the next "faster relative to
+sequential" wins are. Plan, in priority order:
+
+### P4 — O(n) `cum_count` (replace the 1M-element `stable_sort`) — *do first*
+`cum_count` (utils.h) computes, for each event, how many earlier events share its
+worker — currently via a **full `std::stable_sort` of all `eff_num_steps` (1M)
+elements** plus rank/bincount passes. That sort is the single biggest sub-cost.
+The same result is a one-pass running counter: `result[i] = count[workers[i]]++`
+over an `O(n_workers)` counter array. **Integer math → bit-identical.**
+- **Measured (microbench, 1M events):** stable_sort path **93.3 ms** → counter
+  path **2.3 ms** = **41× on this sub-step**, ~91 ms/iter saved (~19% of total
+  runtime, ~0.36 s off the 3.16 s wall at 4 iterations).
+- Risk: none. Drop-in, integer, exact. **Highest ROI / lowest risk — start here.**
+
+### P5 — OpenMP across prep's element-wise loops (24 idle cores)
+After P4, the remaining ~400 ms/iter of prep is mostly embarrassingly parallel
+per-element work: the three `get_slice` loops, the worker mapping, `valid_mask`,
+`order_2D_relative`, `order_2D_index` (writes are unique per `(w,s)` so no race),
+the event-build + inventory-scatter loop, and the **outer `w` loop of
+`compute_capacity_delta`**. All integer or independent-row float → bit-identical
+under `#pragma omp parallel for`.
+- **Caveat:** the *cumsum* (prefix scan) inside `compute_capacity_delta` is a
+  sequential dependency; keep it serial (or use a parallel scan, which reorders
+  float adds and would break bit-identicality). Parallelize only the gather/diff
+  loop that follows it.
+- **Estimated:** if ~75% of post-P4 prep parallelizes at ~8×, prep drops from
+  ~400 to ~140 ms/iter — the largest single remaining win.
+
+### P6 — Persistent prep scratch buffers
+Every `iterate_core` call heap-allocates ~15 vectors sized `O(window)` /
+`O(n_products)` (`slice_*`, `product_worker_map`, `workers`, `order_2D_*`,
+`valid_mask`, `capacity_delta`, `ev2d_*`, …). Hoist them into `IterContext`,
+allocate once, reuse. Removes per-iteration allocator + zero-fill + page-fault
+cost, and is a **prerequisite for P5** (stable buffers to parallelize over).
+
+### P7 — Strength-reduce `get_slice` (kill the double modulo)
+`get_slice_int` does two `%` per element across three 1M arrays (6M modulos/iter).
+The roll is a rotation: emit it as two contiguous `std::copy` ranges instead.
+Integer, exact, easy.
+
+### P8 — Warp-parallel kernel (now only 21%, but the next ceiling after prep)
+Kernel is launched `<<<n_workers, 1>>>` (one thread/block; 31/32 of each warp
+idle). A warp-per-worker design parallelizes the per-event NN matvec/feasibility
+scan. **Caveat (unchanged):** changes float reduction order → breaks the
+bit-identical oracle; needs a tolerance oracle or a fixed reduction order first.
+Deprioritized vs. prep because it is only 21% at scale.
+
+### P9 — Move prep onto the GPU (architectural, highest ceiling)
+Since prep is 68% and pure array transforms (gather/scatter, counting, cumsum) on
+data that is *already going to the device*, porting it to CUDA removes the CPU from
+the hot path entirely. Largest effort and the cumsum carries the same float-order
+risk as P5; sequence it after P4–P7 have proven the host-side wins.
+
+### Projected trajectory (1M-event wall clock, 3.16 s today)
+| Step | prep ms/iter | est. wall | note |
+|------|-------------:|----------:|------|
+| now (54dcf3e) | 491 | 3.16 s | — |
+| +P4 | ~400 | ~2.8 s | bit-identical, trivial |
+| +P5/P6/P7 | ~140 | ~1.8 s | bit-identical, OpenMP |
+| +P8 (kernel) | ~140 | ~1.4 s | needs oracle change |
+| +P9 (GPU prep) | — | well under 1 s | architectural |
+
+(Estimates are back-of-envelope from the phase profile; each will be measured and
+logged as an entry above when implemented.)
