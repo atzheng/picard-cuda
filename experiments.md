@@ -149,4 +149,31 @@ GPU-port prep).
 | E1 (`54dcf3e`, #1–#3) | 3.18 s | 35.6× |
 | E2 (#4–#7 host prep)  | 1.77 s | 64.1× |
 | E3 (#8 warp kernel)   | 1.37 s | 82.8× |
-| **E4 (#9 post)**      | **1.09 s** | **104.2×** |
+| E4 (#9 post)          | 1.09 s | 104.2× |
+| **E5 (#10 P5b prep scan)** | **0.870 s** | **130.2×** |
+
+---
+
+## E5 — Same workload after the parallel/persistent capacity-delta scan (#10)
+
+- **Commit:** _(this commit)_ — `compute_capacity_delta`'s `cumsum` prefix scan made
+  persistent (no per-iteration 124 MB alloc+zero) and parallelized across the `np1`
+  independent node-columns; `random_assignment`'s assignment scatter parallelized.
+  See `OPTIMIZATIONS.md` §10.
+- **Correctness:** the column-parallel scan is **bit-identical** to the prior serial
+  row-major scan (`x + 0.0f == x`, per-column add order preserved). Cross-checked
+  with `LEGACY_KERNEL=1`: Picard+#10 is **0/1,000,000** vs. sequential with iteration
+  count/conflicts unchanged. Default warp kernel: 0/1,000,000.
+
+| Mode | Configuration | Wall time | Detail |
+|------|---------------|----------:|--------|
+| Sequential | single-thread scan | 113.25 s | unchanged |
+| Parallel (Picard, warp kernel) | 10,000 workers × 100 steps/worker | **0.870 s** | 4 iterations, 1 conflict |
+
+**Speedup: 130.2×** (113.25 s → 0.870 s) — up from 104.2× (E4). Host prep fell
+**120.5 → 51.2 ms/iter (2.35×)**.
+
+**Phase profile (`PROFILE=1`):** prep 51.2 ms (44.8%), kernel 29.2 ms (25.5%), H2D
+22.6 ms (19.8%), post 11.1 ms (9.7%), D2H 0.3 ms. Prep is still the top phase but no
+longer dominant — kernel, H2D and the remaining prep are now within ~2× of each
+other; next targets in `OPTIMIZATIONS.md` "Next steps" (H2D compaction, P9 GPU prep).

@@ -218,6 +218,7 @@ struct IterContext {
     std::vector<int> workers, index_within_worker, cum_counts;
     std::vector<int> order_2D_index, valid_mask, order_2D_relative;
     std::vector<float> capacity_delta;
+    std::vector<float> cumsum_scratch;  // [eff_num_steps * np1] prefix-scan buffer (P5b)
     std::vector<int> ev2d_product, ev2d_quantity, ev2d_ntf;
     std::vector<uint64_t> worker_keys;
     std::vector<int> fulfill_2D;
@@ -296,6 +297,7 @@ static void init_iter_context(
     ctx.valid_mask.resize(evc);
     ctx.order_2D_relative.resize(evc);
     ctx.capacity_delta.resize(evc * np1);
+    ctx.cumsum_scratch.resize((size_t)ens * np1);
     ctx.ev2d_product.resize(evc);
     ctx.ev2d_quantity.resize(evc);
     ctx.ev2d_ntf.resize(evc * np1);
@@ -438,7 +440,7 @@ static void iterate_core(
     compute_capacity_delta_other_threads(
         np1, slice_fulfill.data(), slice_quantities.data(),
         order_2D_relative.data(), n_workers, num_steps, eff_num_steps,
-        capacity_delta.data());
+        capacity_delta.data(), ctx.cumsum_scratch.data());
 
     // --- Step 2: Build event arrays for the kernel ---
     // Window-scoped inventory reshape. The kernel only ever reads the inventory

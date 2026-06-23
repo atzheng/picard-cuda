@@ -39,10 +39,13 @@ All numbers best-of-3, measured together in a single run for consistency.
 | 4–7 | O(n) cum_count + persistent buffers + get_slice copies + OpenMP | 0.247 s | 0.200 s | 1.20× | 2.11× |
 | 8 | Warp-cooperative kernel (tolerance oracle) | 0.160 s | 0.113 s | 1.54× | 3.26× |
 | 9 | O(window) max_t_reset (drop post sort) | 0.144 s | 0.100 s | 1.12× | **3.62×** |
+| 10 | Parallel/persistent capacity-delta scan (P5b) | 0.167 s | 0.108 s | ~flat | 3.62× |
 
-(#4–#7 were driven by the **1M-event** workload where `prep` dominates — see the
-"Scaling to 1,000,000 events" section below for the per-step phase breakdown; the
-sub100k columns here are the cross-check that they stay bit-identical and still help.)
+(#4–#7 and #10 were driven by the **1M-event** workload where `prep` dominates — see
+the "Scaling to 1,000,000 events" section below for the per-step phase breakdown; the
+sub100k columns here are the cross-check that they stay bit-identical and still help.
+#10's win is in the large-window cumsum, so on the tiny sub100k window it is flat —
+within the heavy run-to-run noise on this shared host — while at 1M it cuts prep 2.35×.)
 
 ---
 
@@ -310,32 +313,71 @@ post (CPU)      6.0%    11.1 ms/iter
 D2H readback    0.2%     0.3 ms/iter
 ```
 
+### 10. Parallel + persistent capacity-delta scan (P5b)
+
+**Diagnosis.** After #9, prep was 65.5% (120.5 ms/iter) and the single largest
+piece left in it was `compute_capacity_delta_other_threads`. Its `cumsum` prefix
+scan was (a) `std::vector<float>(eff_num_steps · np1)` — a **124 MB alloc + zero
+every iteration** (1M × 31 floats) — and (b) a fully **serial** scan of all 31M
+elements, while 23 cores idled. (The gather below it was already OpenMP'd in #5.)
+
+**Change.** Two parts:
+- **Persistent buffer.** Hoisted the `cumsum` scratch into `IterContext` (sized once
+  in `init_iter_context`, passed in by pointer). Removes the per-iteration 124 MB
+  `malloc`/zero/`free` — every element is overwritten by the scan anyway, so the
+  zero-init was pure waste.
+- **Parallel scan across columns.** Each node-column `n` is an *independent* prefix
+  sum over `t`, so the scan parallelizes across the `np1` columns with OpenMP. Within
+  a column the adds still run in ascending-`t` order, and dropping the `+0.0f` term
+  when `fulfill[t]≠n` is exact (`x + 0.0f == x` in IEEE), so it stays
+  **bit-identical** to the serial row-major scan. Also parallelized the
+  `random_assignment` final assignment loop (scatter by a permutation ⇒ each product
+  written once ⇒ race-free); the Fisher–Yates shuffle itself stays serial.
+
+**Result.** prep **120.5 → 51.2 ms/iter (2.35×)**; 1M wall 1.09 → **0.870 s**.
+Cumulative vs. sequential: 113.25 s → 0.870 s = **130.2×**. Bit-identical:
+`LEGACY_KERNEL=1` Picard is **0/1,000,000** vs. sequential, iteration
+count/conflicts unchanged; default warp kernel also 0/1,000,000. (sub100k is flat —
+the win is in the large-window cumsum, absent on a 10k-element window — and stays
+0 mismatches on C and A.)
+
+**Profile after (1M, `PROFILE=1`):**
+```
+prep (CPU)     44.8%    51.2 ms/iter   <-- still the top phase, but no longer dominant
+kernel         25.5%    29.2 ms/iter
+H2D upload     19.8%    22.6 ms/iter
+post (CPU)      9.7%    11.1 ms/iter
+D2H readback    0.3%     0.3 ms/iter
+```
+
 ---
 
 ## Next steps (diagnosed, not yet implemented)
 
-P4–P8 are **done** (see #4–#8 above). After them the 1M profile is:
+P4–P9 and P5b (#10) are **done**. After them the 1M profile is:
 
 ```
-prep (CPU)     65.5%   120.5 ms/iter   <-- host prep is the bottleneck
-kernel         15.9%    29.2 ms/iter
-H2D upload     12.5%    23.0 ms/iter
-post (CPU)      6.0%    11.1 ms/iter
-D2H readback    0.2%     0.3 ms/iter
+prep (CPU)     44.8%    51.2 ms/iter   <-- still top, but H2D + kernel now comparable
+kernel         25.5%    29.2 ms/iter
+H2D upload     19.8%    22.6 ms/iter
+post (CPU)      9.7%    11.1 ms/iter
+D2H readback    0.3%     0.3 ms/iter
 ```
 
-P4–P8 and P-post (#9) are **done**. With the kernel at 15.9% and post at 6.0%,
-**host prep is now 65.5%** — the clear remaining bottleneck. Targets in priority
-order:
+Prep is no longer the runaway bottleneck — kernel (25.5%), H2D (19.8%) and the
+remaining prep (44.8%) are now within ~2× of each other, so the next win is smaller
+and more spread out. Targets in priority order:
 
-### P5b — Parallelize the remaining serial prep (the 65.5%)
-prep's `reshape`/event-build and `compute_capacity_delta` gather are already
-OpenMP'd; the un-parallelized chunks left are the `compute_capacity_delta` cumsum
-**prefix scan** (a blocked parallel scan reorders float adds — now acceptable under
-the tolerance oracle) and the serial **Fisher–Yates shuffle** in
-`random_assignment` (`O(n_products)`; parallelizable with a different permutation
-algorithm, though that changes the worker assignment and so must be re-validated
-against the decision tolerance).
+### P5c — Remaining serial prep (Fisher–Yates shuffle)
+The cumsum scan and the assignment scatter are now parallel; the serial pieces left
+in prep are `cum_count` (O(window), ~2 ms — cheap) and the **Fisher–Yates shuffle**
+in `random_assignment` (`O(n_products)` ≈ 567K, serial RNG chain). Parallelizing the
+shuffle needs a different permutation algorithm, which changes the worker assignment
+and so must be re-validated against the decision tolerance.
+
+### H2D (19.8%) — compact/pinned `worker_inv` upload
+Now the #2 phase. The 12.7 MB `worker_inv` upload per iteration is mostly dead rows;
+a compact per-window layout or pinned host memory shrinks it.
 
 ### P9 — Move prep onto the GPU (architectural, highest ceiling)
 prep is ~66% of runtime and is pure array transforms (gather/scatter, counting,
@@ -352,5 +394,6 @@ per-window layout or pinned host memory shrinks it.
 | `54dcf3e` (#1–#3) | 3.16 s | starting point |
 | +#4–#7 | 1.77 s | bit-identical, 64.1× vs sequential |
 | +#8 warp kernel | 1.37 s | tolerance oracle (0 mismatches), 82.8× |
-| **+#9 post O(window) (done)** | **1.09 s** | **exact; 104.2× vs sequential** |
-| +P5b / P9 (prep) | well under 1 s | parallelize / GPU-port prep |
+| +#9 post O(window) | 1.09 s | exact; 104.2× vs sequential |
+| **+#10 P5b prep scan (done)** | **0.870 s** | **exact; 130.2× vs sequential** |
+| +H2D / P9 (prep on GPU) | toward 0.5 s | compact upload / GPU-port prep |

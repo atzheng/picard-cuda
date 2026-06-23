@@ -88,6 +88,10 @@ inline void random_assignment(
     // in_order_assigned_id[k] = k / n_workers
     // Then: product_worker_map[perm[i]] = in_order_assigned_worker[i]
     //       product_ids_within_worker[perm[i]] = in_order_assigned_id[i]
+    // perm is a permutation, so each p = perm[i] is written exactly once -> the
+    // scatter is race-free and parallelizable (P5b). The Fisher-Yates above stays
+    // serial (RNG chain), but this assignment is the larger of the two passes.
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < n_products; i++) {
         int p = perm[i];
         product_worker_map[p] = i % n_workers;
@@ -108,19 +112,32 @@ inline void compute_capacity_delta_other_threads(
     int n_workers,
     int num_steps,
     int eff_num_steps,
-    float* capacity_delta      // output: [n_workers * num_steps * n_nodes_plus1]
+    float* capacity_delta,     // output: [n_workers * num_steps * n_nodes_plus1]
+    float* cumsum_scratch = nullptr  // optional [eff_num_steps * n_nodes_plus1] buffer
 ) {
     int total_2D = n_workers * num_steps;
 
     // Step 1: one_hot_fulfill[t, n] = quantity[t] if fulfill[t]==n, else 0
     // cumsum_fulfill[t, n] = -sum_{s<=t} one_hot_fulfill[s, n]
-    // We compute this as running totals
-    std::vector<float> cumsum(eff_num_steps * n_nodes_plus1, 0.0f);
-    for (int t = 0; t < eff_num_steps; t++) {
-        for (int n = 0; n < n_nodes_plus1; n++) {
-            float prev = (t > 0) ? cumsum[(t - 1) * n_nodes_plus1 + n] : 0.0f;
-            float delta = (fulfill[t] == n) ? -(float)quantities[t] : 0.0f;
-            cumsum[t * n_nodes_plus1 + n] = prev + delta;
+    // Each node-column n is an INDEPENDENT prefix sum over t, so we parallelize
+    // across columns (P5b). Within a column the additions still run in ascending-t
+    // order, and skipping the +0.0f term when fulfill[t]!=n is exact (x + 0.0f == x
+    // in IEEE), so the result is bit-identical to the previous serial row-major scan.
+    // Caller supplies a persistent buffer to avoid a per-iteration 124 MB alloc+zero.
+    std::vector<float> owned;
+    float* cumsum;
+    if (cumsum_scratch) {
+        cumsum = cumsum_scratch;
+    } else {
+        owned.assign((size_t)eff_num_steps * n_nodes_plus1, 0.0f);
+        cumsum = owned.data();
+    }
+    #pragma omp parallel for schedule(static)
+    for (int n = 0; n < n_nodes_plus1; n++) {
+        float acc = 0.0f;  // running prefix total for this column
+        for (int t = 0; t < eff_num_steps; t++) {
+            if (fulfill[t] == n) acc -= (float)quantities[t];
+            cumsum[(size_t)t * n_nodes_plus1 + n] = acc;
         }
     }
 
