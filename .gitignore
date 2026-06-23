@@ -1,0 +1,12 @@
+# Build artifacts
+build/
+
+# Datasets (large binary .npy / raw inputs — regenerate from source)
+data/
+
+# Editor / OS cruft
+*.swp
+.DS_Store
+
+# Local Claude Code settings
+.claude/settings.local.json
