@@ -3,6 +3,43 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <vector>
+#include <memory>
+
+// ---- No-init allocator ----
+// std::vector::resize() value-initializes (zero-fills) new elements. For large
+// scratch buffers that are fully overwritten before they are ever read, that
+// zero-fill is pure waste — and for ~600 MB of per-window scratch it cost ~270 ms
+// of serial memset + first-touch page-faulting in init_iter_context. This allocator
+// makes the no-arg construct() a no-op, so resize() allocates without touching the
+// pages; they then fault in lazily (and in parallel) during the OpenMP write loops
+// that fill them. Only use it for buffers that are fully written before any read.
+template <typename T>
+struct NoInitAlloc {
+    using value_type = T;
+    NoInitAlloc() noexcept = default;
+    template <typename U> NoInitAlloc(const NoInitAlloc<U>&) noexcept {}
+    template <typename U> struct rebind { using other = NoInitAlloc<U>; };
+    T* allocate(std::size_t n) {
+        return static_cast<T*>(::operator new(n * sizeof(T)));
+    }
+    void deallocate(T* p, std::size_t) noexcept { ::operator delete(p); }
+    // Leave trivially-constructible elements uninitialized (the whole point).
+    template <typename U>
+    void construct(U* p) noexcept(std::is_nothrow_default_constructible<U>::value) {
+        if (!std::is_trivially_default_constructible<U>::value) ::new ((void*)p) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+        ::new ((void*)p) U(std::forward<Args>(args)...);
+    }
+};
+template <typename A, typename B>
+inline bool operator==(const NoInitAlloc<A>&, const NoInitAlloc<B>&) noexcept { return true; }
+template <typename A, typename B>
+inline bool operator!=(const NoInitAlloc<A>&, const NoInitAlloc<B>&) noexcept { return false; }
+
+template <typename T> using NoInitVec = std::vector<T, NoInitAlloc<T>>;
 
 // ---- Device utility functions ----
 

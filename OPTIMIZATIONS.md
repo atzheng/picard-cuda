@@ -350,11 +350,53 @@ post (CPU)      9.7%    11.1 ms/iter
 D2H readback    0.3%     0.3 ms/iter
 ```
 
+### 11. Init overhead investigation — no-init scratch, and two negative results
+
+After #10 the per-iteration loop is tight, so the **one-time setup** in
+`run_algorithm_day` (which the `--- total time ---` clock wraps) became the focus.
+Instrumenting `init_iter_context` on the 1M workload:
+
+```
+[init] D2H events       72 ms    (event arrays device->host)
+[init] D2H state        41 ms    (capacity/inventory/fulfill device->host)
+[init] host resizes    270 ms    <-- value-initializing ~600 MB of scratch
+[init] cudaMalloc        1 ms
+```
+
+So **init alone is ~0.45 s of the 0.87 s wall** — at only 4 iterations it rivals the
+loop. The 270 ms is the `std::vector::resize` zero-fill of the big per-window scratch
+(`worker_inv`, `capacity_delta`, `cumsum_scratch`, `ev2d_ntf`, … ≈ 600 MB), all of
+which is **fully overwritten before it is ever read**.
+
+**Change (kept).** A `NoInitAlloc` (default-init allocator) backs those scratch
+vectors, so `resize()` allocates without the serial zero-fill. Correctness is
+unchanged (every buffer is written before read; `LEGACY_KERNEL=1` still 0/1,000,000,
+4 iters). The init `host resizes` line drops **270 → 0.1 ms**.
+
+**But wall is unchanged (~0.87 s)** — an honest negative result worth recording. The
+270 ms was never the *memset*; it was **first-touch page-faulting** ~600 MB of fresh
+anonymous memory. With no-init, those faults simply move into iteration 1's prep
+write loops (prep 51 → 142 ms on iter 1). The Linux kernel serializes anonymous
+faults on `mmap_lock`, so OpenMP doesn't parallelize them away, and
+`madvise(MADV_HUGEPAGE)` was measured to **not** help in this container (THP can't
+assemble 2 MB pages). So touching ~600 MB once costs ~270 ms wherever it happens —
+a hard floor until the *footprint itself* shrinks.
+
+**Also tried, reverted (negative):** pinning the H2D source buffers via
+`cudaHostRegister`. It gave a real **1.54× per-iteration H2D** (22.6 → 14.6 ms), but
+page-locking ~500 MB is a one-time cost that 4 iterations can't amortize, so wall was
+net-neutral/slightly worse. Reverted. (Would help iteration-heavy configs.)
+
+**Takeaway → next.** The wall is now ~half one-time cost (faulting ~270 ms + D2H
+~115 ms) and ~half loop. Faulting it *faster* is blocked (no huge pages), so the win
+is to **fault and upload less** — i.e. shrink the per-window footprint. #12 does that
+by removing the largest scratch buffer outright.
+
 ---
 
 ## Next steps (diagnosed, not yet implemented)
 
-P4–P9 and P5b (#10) are **done**. After them the 1M profile is:
+P4–P9, P5b (#10), and the init cleanup (#11) are **done**. After them the 1M profile is:
 
 ```
 prep (CPU)     44.8%    51.2 ms/iter   <-- still top, but H2D + kernel now comparable

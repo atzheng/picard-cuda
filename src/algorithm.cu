@@ -198,31 +198,37 @@ struct IterContext {
     int n_workers = 0, num_steps = 0, max_ppw = 0;
     size_t ev_count = 0;
 
-    // Immutable event data — copied from the device once and reused.
+    // Immutable event data — copied from the device once and reused. (h_event_ntf
+    // is large and fully overwritten by the init D2H, so it skips zero-init.)
     std::vector<int> h_event_products;
     std::vector<int> h_event_quantities;
-    std::vector<int> h_event_ntf;
+    NoInitVec<int> h_event_ntf;
 
     // Authoritative mutable state, resident on the host across the whole loop.
+    // (h_inventory is fully written by the init D2H before any read → no-init.)
     std::vector<float> h_capacity;
-    std::vector<float> h_inventory;
+    NoInitVec<float> h_inventory;
     std::vector<int>   h_fulfill;
 
     // Persistent host scratch (sized once in init, refilled each iteration —
     // avoids ~15 heap allocations per Picard iteration and gives OpenMP stable
     // buffers to write into).
+    // All persistent scratch below is fully overwritten before it is read each
+    // iteration, so it uses the no-init allocator: resize() allocates without the
+    // serial zero-fill, and the pages fault in (in parallel) during the OpenMP
+    // write loops that fill them. This removed ~270 ms of init zero-fill (P11).
     int eff_num_steps = 0;
-    std::vector<float> worker_inv;
-    std::vector<int> slice_products, slice_quantities, slice_fulfill;
-    std::vector<int> product_worker_map, product_ids_within_worker;
-    std::vector<int> workers, index_within_worker, cum_counts;
-    std::vector<int> order_2D_index, valid_mask, order_2D_relative;
-    std::vector<float> capacity_delta;
-    std::vector<float> cumsum_scratch;  // [eff_num_steps * np1] prefix-scan buffer (P5b)
-    std::vector<int> ev2d_product, ev2d_quantity, ev2d_ntf;
-    std::vector<uint64_t> worker_keys;
-    std::vector<int> fulfill_2D;
-    std::vector<unsigned char> present;  // window presence bitmap for max_t_reset
+    NoInitVec<float> worker_inv;
+    NoInitVec<int> slice_products, slice_quantities, slice_fulfill;
+    NoInitVec<int> product_worker_map, product_ids_within_worker;
+    NoInitVec<int> workers, index_within_worker, cum_counts;
+    NoInitVec<int> order_2D_index, valid_mask, order_2D_relative;
+    NoInitVec<float> capacity_delta;
+    NoInitVec<float> cumsum_scratch;  // [eff_num_steps * np1] prefix-scan buffer (P5b)
+    NoInitVec<int> ev2d_product, ev2d_quantity, ev2d_ntf;
+    NoInitVec<uint64_t> worker_keys;
+    NoInitVec<int> fulfill_2D;
+    NoInitVec<unsigned char> present;  // window presence bitmap for max_t_reset
 
     // Persistent device scratch (allocated once, reused each iteration).
     float* d_worker_inv = nullptr;
@@ -254,6 +260,12 @@ static void init_iter_context(
 
     int np1 = ctx.np1;
 
+    bool prof_init = (getenv("PROFILE") != nullptr);
+    double ti = prof_init ? prof_now() : 0.0;
+    auto mark = [&](const char* tag) {
+        if (prof_init) { double n = prof_now(); printf("  [init] %-18s %7.1f ms\n", tag, 1000.0*(n-ti)); ti = n; }
+    };
+
     // Cache immutable event arrays once (these never change across iterations).
     ctx.h_event_products.resize(ctx.n_events);
     ctx.h_event_quantities.resize(ctx.n_events);
@@ -264,6 +276,7 @@ static void init_iter_context(
                           ctx.n_events * sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(ctx.h_event_ntf.data(), events.node_index_near_to_far,
                           (size_t)ctx.n_events * np1 * sizeof(int), cudaMemcpyDeviceToHost));
+    mark("D2H events");
 
     // Pull initial mutable state once; the host copy is authoritative thereafter.
     ctx.h_capacity.resize(np1);
@@ -275,10 +288,13 @@ static void init_iter_context(
                           (size_t)ctx.n_products * np1 * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(ctx.h_fulfill.data(), s.fulfill,
                           ctx.n_events * sizeof(int), cudaMemcpyDeviceToHost));
+    mark("D2H state");
 
     ctx.prof.on = (getenv("PROFILE") != nullptr);
 
-    ctx.worker_inv.assign((size_t)ctx.n_workers * ctx.max_ppw * np1, 0.0f);
+    // No zero-fill: every slot the kernel reads is overwritten by the reshape loop
+    // before upload, and untouched slots are never read (P2). Uninitialized is safe.
+    ctx.worker_inv.resize((size_t)ctx.n_workers * ctx.max_ppw * np1);
 
     // Size persistent prep scratch once. eff_num_steps and the window dims depend
     // only on config + n_events, so they are fixed across the whole loop.
@@ -304,6 +320,7 @@ static void init_iter_context(
     ctx.worker_keys.resize(ctx.n_workers);
     ctx.fulfill_2D.resize(evc);
     ctx.present.resize(ens);
+    mark("host resizes");
 
     // Per-iteration buffer sizes depend only on config dims, so allocate once.
     size_t inv_bytes = (size_t)ctx.n_workers * ctx.max_ppw * np1 * sizeof(float);
@@ -315,6 +332,7 @@ static void init_iter_context(
     CUDA_CHECK(cudaMalloc(&ctx.d_valid_mask, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_worker_keys, ctx.n_workers * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&ctx.d_fulfill_2D, ctx.ev_count * sizeof(int)));
+    mark("cudaMalloc");
 }
 
 // Push the final authoritative host state back to the device once, after the loop.
@@ -355,30 +373,30 @@ static void iterate_core(
 
     // Authoritative state lives in the context — no per-iteration D2H copies.
     std::vector<float>& h_capacity = ctx.h_capacity;
-    std::vector<float>& h_inventory = ctx.h_inventory;
+    auto& h_inventory = ctx.h_inventory;
     std::vector<int>& h_fulfill = ctx.h_fulfill;
     std::vector<int>& h_event_products = ctx.h_event_products;
     std::vector<int>& h_event_quantities = ctx.h_event_quantities;
-    std::vector<int>& h_event_ntf = ctx.h_event_ntf;
+    auto& h_event_ntf = ctx.h_event_ntf;
 
     PhaseProf& prof = ctx.prof;
     double tp = prof.on ? prof_now() : 0.0;
 
     // Bind persistent scratch (allocated once in init_iter_context).
-    std::vector<int>& slice_products = ctx.slice_products;
-    std::vector<int>& slice_quantities = ctx.slice_quantities;
-    std::vector<int>& slice_fulfill = ctx.slice_fulfill;
-    std::vector<int>& product_worker_map = ctx.product_worker_map;
-    std::vector<int>& product_ids_within_worker = ctx.product_ids_within_worker;
-    std::vector<int>& workers = ctx.workers;
-    std::vector<int>& index_within_worker = ctx.index_within_worker;
-    std::vector<int>& order_2D_index = ctx.order_2D_index;
-    std::vector<int>& valid_mask = ctx.valid_mask;
-    std::vector<int>& order_2D_relative = ctx.order_2D_relative;
-    std::vector<float>& capacity_delta = ctx.capacity_delta;
-    std::vector<int>& ev2d_product = ctx.ev2d_product;
-    std::vector<int>& ev2d_quantity = ctx.ev2d_quantity;
-    std::vector<int>& ev2d_ntf = ctx.ev2d_ntf;
+    auto& slice_products = ctx.slice_products;
+    auto& slice_quantities = ctx.slice_quantities;
+    auto& slice_fulfill = ctx.slice_fulfill;
+    auto& product_worker_map = ctx.product_worker_map;
+    auto& product_ids_within_worker = ctx.product_ids_within_worker;
+    auto& workers = ctx.workers;
+    auto& index_within_worker = ctx.index_within_worker;
+    auto& order_2D_index = ctx.order_2D_index;
+    auto& valid_mask = ctx.valid_mask;
+    auto& order_2D_relative = ctx.order_2D_relative;
+    auto& capacity_delta = ctx.capacity_delta;
+    auto& ev2d_product = ctx.ev2d_product;
+    auto& ev2d_quantity = ctx.ev2d_quantity;
+    auto& ev2d_ntf = ctx.ev2d_ntf;
 
     // --- Step 1: Build 2D event structure ---
     int eff_num_steps = ctx.eff_num_steps;
@@ -389,7 +407,7 @@ static void iterate_core(
     // per-element double modulo (P7): out[0..eff-k) = arr[t0+k..t0+eff),
     // out[eff-k..eff) = arr[t0..t0+k), with k = (t_reset - t0) mod eff.
     int k = (algo_state.t_reset - t0) % eff_num_steps;
-    auto get_slice_int = [&](const std::vector<int>& arr, std::vector<int>& out) {
+    auto get_slice_int = [&](const auto& arr, auto& out) {
         std::copy(arr.begin() + t0 + k, arr.begin() + t0 + eff_num_steps, out.begin());
         std::copy(arr.begin() + t0, arr.begin() + t0 + k, out.begin() + (eff_num_steps - k));
     };
@@ -450,7 +468,7 @@ static void iterate_core(
     // slot the kernel reads is overwritten here from the authoritative host
     // inventory before upload, and untouched slots are never read.
     double tr = prof.on ? prof_now() : 0.0;
-    std::vector<float>& worker_inv = ctx.worker_inv;
+    auto& worker_inv = ctx.worker_inv;
 
     // Independent per slot i. Two valid events that share a product map to the
     // same worker_inv (w,pid) row, but they also share the same source inventory
@@ -482,7 +500,7 @@ static void iterate_core(
     if (prof.on) prof.reshape += prof_now() - tr;
 
     // Prepare RNG keys for workers (split_key chains serially)
-    std::vector<uint64_t>& worker_keys = ctx.worker_keys;
+    auto& worker_keys = ctx.worker_keys;
     uint64_t wk = algo_state.rng_key;
     for (int w = 0; w < n_workers; w++) {
         split_key(wk, wk, worker_keys[w]);
@@ -539,7 +557,7 @@ static void iterate_core(
     if (prof.on) { prof.kernel += prof_now() - tp; tp = prof_now(); }
 
     // Read back fulfill_2D
-    std::vector<int>& fulfill_2D = ctx.fulfill_2D;
+    auto& fulfill_2D = ctx.fulfill_2D;
     CUDA_CHECK(cudaMemcpy(fulfill_2D.data(), ctx.d_fulfill_2D, ev_count * sizeof(int), cudaMemcpyDeviceToHost));
 
     if (prof.on) { prof.d2h += prof_now() - tp; tp = prof_now(); }
@@ -552,7 +570,7 @@ static void iterate_core(
     //     hole — O(window) — replacing the previous O(window log window) sort.
     //     This reproduces the sort-based value exactly (the first gap among the
     //     sorted assigned indices is the first missing offset above the run).
-    std::vector<unsigned char>& present = ctx.present;
+    auto& present = ctx.present;
     std::fill(present.begin(), present.begin() + eff_num_steps, (unsigned char)0);
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < n_workers * num_steps; i++) {
