@@ -198,11 +198,12 @@ struct IterContext {
     int n_workers = 0, num_steps = 0, max_ppw = 0;
     size_t ev_count = 0;
 
-    // Immutable event data — copied from the device once and reused. (h_event_ntf
-    // is large and fully overwritten by the init D2H, so it skips zero-init.)
+    // Immutable event data — copied from the device once and reused. The full
+    // near-to-far ordering is never needed on the host: it is immutable and already
+    // device-resident (events.node_index_near_to_far), so the kernel indexes it
+    // directly by global event index (P12) instead of a per-window host copy.
     std::vector<int> h_event_products;
     std::vector<int> h_event_quantities;
-    NoInitVec<int> h_event_ntf;
 
     // Authoritative mutable state, resident on the host across the whole loop.
     // (h_inventory is fully written by the init D2H before any read → no-init.)
@@ -225,7 +226,7 @@ struct IterContext {
     NoInitVec<int> order_2D_index, valid_mask, order_2D_relative;
     NoInitVec<float> capacity_delta;
     NoInitVec<float> cumsum_scratch;  // [eff_num_steps * np1] prefix-scan buffer (P5b)
-    NoInitVec<int> ev2d_product, ev2d_quantity, ev2d_ntf;
+    NoInitVec<int> ev2d_product, ev2d_quantity;
     NoInitVec<uint64_t> worker_keys;
     NoInitVec<int> fulfill_2D;
     NoInitVec<unsigned char> present;  // window presence bitmap for max_t_reset
@@ -234,7 +235,8 @@ struct IterContext {
     float* d_worker_inv = nullptr;
     int* d_ev_product = nullptr;
     int* d_ev_quantity = nullptr;
-    int* d_ev_ntf = nullptr;
+    const int* d_event_ntf_full = nullptr;  // borrowed: events.node_index_near_to_far (not owned)
+    int* d_order_2D_index = nullptr;        // global event idx per slot (replaces d_ev_ntf, P12)
     float* d_cap_delta = nullptr;
     int* d_valid_mask = nullptr;
     uint64_t* d_worker_keys = nullptr;
@@ -266,16 +268,16 @@ static void init_iter_context(
         if (prof_init) { double n = prof_now(); printf("  [init] %-18s %7.1f ms\n", tag, 1000.0*(n-ti)); ti = n; }
     };
 
-    // Cache immutable event arrays once (these never change across iterations).
+    // Cache immutable event scalars on the host (products/quantities). The full
+    // near-to-far ordering stays only on the device (borrowed pointer); the kernel
+    // indexes it by global event index, so no host copy / D2H of it is needed (P12).
     ctx.h_event_products.resize(ctx.n_events);
     ctx.h_event_quantities.resize(ctx.n_events);
-    ctx.h_event_ntf.resize((size_t)ctx.n_events * np1);
     CUDA_CHECK(cudaMemcpy(ctx.h_event_products.data(), events.product,
                           ctx.n_events * sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(ctx.h_event_quantities.data(), events.quantity,
                           ctx.n_events * sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(ctx.h_event_ntf.data(), events.node_index_near_to_far,
-                          (size_t)ctx.n_events * np1 * sizeof(int), cudaMemcpyDeviceToHost));
+    ctx.d_event_ntf_full = events.node_index_near_to_far;
     mark("D2H events");
 
     // Pull initial mutable state once; the host copy is authoritative thereafter.
@@ -316,7 +318,6 @@ static void init_iter_context(
     ctx.cumsum_scratch.resize((size_t)ens * np1);
     ctx.ev2d_product.resize(evc);
     ctx.ev2d_quantity.resize(evc);
-    ctx.ev2d_ntf.resize(evc * np1);
     ctx.worker_keys.resize(ctx.n_workers);
     ctx.fulfill_2D.resize(evc);
     ctx.present.resize(ens);
@@ -327,7 +328,7 @@ static void init_iter_context(
     CUDA_CHECK(cudaMalloc(&ctx.d_worker_inv, inv_bytes));
     CUDA_CHECK(cudaMalloc(&ctx.d_ev_product, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_ev_quantity, ctx.ev_count * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&ctx.d_ev_ntf, ctx.ev_count * np1 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ctx.d_order_2D_index, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_cap_delta, ctx.ev_count * np1 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ctx.d_valid_mask, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_worker_keys, ctx.n_workers * sizeof(uint64_t)));
@@ -349,7 +350,7 @@ static void free_iter_context(IterContext& ctx) {
     cudaFree(ctx.d_worker_inv);
     cudaFree(ctx.d_ev_product);
     cudaFree(ctx.d_ev_quantity);
-    cudaFree(ctx.d_ev_ntf);
+    cudaFree(ctx.d_order_2D_index);
     cudaFree(ctx.d_cap_delta);
     cudaFree(ctx.d_valid_mask);
     cudaFree(ctx.d_worker_keys);
@@ -377,7 +378,6 @@ static void iterate_core(
     std::vector<int>& h_fulfill = ctx.h_fulfill;
     std::vector<int>& h_event_products = ctx.h_event_products;
     std::vector<int>& h_event_quantities = ctx.h_event_quantities;
-    auto& h_event_ntf = ctx.h_event_ntf;
 
     PhaseProf& prof = ctx.prof;
     double tp = prof.on ? prof_now() : 0.0;
@@ -396,7 +396,6 @@ static void iterate_core(
     auto& capacity_delta = ctx.capacity_delta;
     auto& ev2d_product = ctx.ev2d_product;
     auto& ev2d_quantity = ctx.ev2d_quantity;
-    auto& ev2d_ntf = ctx.ev2d_ntf;
 
     // --- Step 1: Build 2D event structure ---
     int eff_num_steps = ctx.eff_num_steps;
@@ -473,6 +472,10 @@ static void iterate_core(
     // Independent per slot i. Two valid events that share a product map to the
     // same worker_inv (w,pid) row, but they also share the same source inventory
     // row, so the (identical-value) overlapping writes are race-free for results.
+    // The near-to-far ordering is no longer materialized here: the kernel reads it
+    // straight from the device-resident immutable full ntf, indexed by this slot's
+    // global event index (order_2D_index), which is uploaded below (P12). That drops
+    // a 124 MB host buffer, its 31M-write copy, and a 124 MB H2D upload per iteration.
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < n_workers * num_steps; i++) {
         int idx = order_2D_index[i];
@@ -481,9 +484,6 @@ static void iterate_core(
             int pid = product_ids_within_worker[orig_product];
             ev2d_product[i] = pid;
             ev2d_quantity[i] = h_event_quantities[idx] * valid_mask[i];
-            for (int n = 0; n < np1; n++) {
-                ev2d_ntf[i * np1 + n] = h_event_ntf[idx * np1 + n];
-            }
             int w = i / num_steps;
             float* dst = &worker_inv[(size_t)(w * max_ppw + pid) * np1];
             const float* src = &h_inventory[(size_t)orig_product * np1];
@@ -491,9 +491,6 @@ static void iterate_core(
         } else {
             ev2d_product[i] = 0;
             ev2d_quantity[i] = 0;
-            for (int n = 0; n < np1; n++) {
-                ev2d_ntf[i * np1 + n] = np1 - 1;  // sentinel
-            }
         }
     }
 
@@ -515,7 +512,9 @@ static void iterate_core(
     CUDA_CHECK(cudaMemcpy(ctx.d_worker_inv, worker_inv.data(), inv_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_ev_product, ev2d_product.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_ev_quantity, ev2d_quantity.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(ctx.d_ev_ntf, ev2d_ntf.data(), ev_count * np1 * sizeof(int), cudaMemcpyHostToDevice));
+    // P12: upload the per-slot global event index (4 MB) instead of the per-window
+    // ntf (124 MB); the kernel gathers the ntf row from the device-resident full ntf.
+    CUDA_CHECK(cudaMemcpy(ctx.d_order_2D_index, order_2D_index.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_cap_delta, capacity_delta.data(), ev_count * np1 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_valid_mask, valid_mask.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_worker_keys, worker_keys.data(), n_workers * sizeof(uint64_t), cudaMemcpyHostToDevice));
@@ -535,7 +534,8 @@ static void iterate_core(
         simulate_worker_kernel<<<n_workers, 1>>>(
             nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
             ctx.d_worker_inv, algo_state.capacity,
-            ctx.d_ev_product, ctx.d_ev_quantity, ctx.d_ev_ntf, ctx.d_cap_delta,
+            ctx.d_ev_product, ctx.d_ev_quantity,
+            ctx.d_event_ntf_full, ctx.d_order_2D_index, ctx.d_cap_delta,
             ctx.d_valid_mask, ctx.d_worker_keys,
             n_workers, num_steps, max_ppw, np1,
             ctx.d_fulfill_2D
@@ -545,7 +545,8 @@ static void iterate_core(
         simulate_worker_kernel_warp<<<blocks, WARPS_PER_BLOCK * 32>>>(
             nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
             ctx.d_worker_inv, algo_state.capacity,
-            ctx.d_ev_product, ctx.d_ev_quantity, ctx.d_ev_ntf, ctx.d_cap_delta,
+            ctx.d_ev_product, ctx.d_ev_quantity,
+            ctx.d_event_ntf_full, ctx.d_order_2D_index, ctx.d_cap_delta,
             ctx.d_valid_mask, ctx.d_worker_keys,
             n_workers, num_steps, max_ppw, np1,
             ctx.d_fulfill_2D

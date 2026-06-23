@@ -150,7 +150,8 @@ GPU-port prep).
 | E2 (#4–#7 host prep)  | 1.77 s | 64.1× |
 | E3 (#8 warp kernel)   | 1.37 s | 82.8× |
 | E4 (#9 post)          | 1.09 s | 104.2× |
-| **E5 (#10 P5b prep scan)** | **0.870 s** | **130.2×** |
+| E5 (#10 P5b prep scan) | 0.870 s | 130.2× |
+| E6 (#11 init + #12 ntf elim) | 0.756 s | 149.8× |
 
 ---
 
@@ -177,3 +178,32 @@ GPU-port prep).
 22.6 ms (19.8%), post 11.1 ms (9.7%), D2H 0.3 ms. Prep is still the top phase but no
 longer dominant — kernel, H2D and the remaining prep are now within ~2× of each
 other; next targets in `OPTIMIZATIONS.md` "Next steps" (H2D compaction, P9 GPU prep).
+
+---
+
+## E6 — Same workload after init cleanup (#11) + ntf elimination (#12)
+
+- **Commit:** _(this commit)_ — `#11`: a no-init allocator removes the 270 ms serial
+  zero-fill of ~600 MB of init scratch (wall-neutral; the cost was page-faulting, not
+  the memset — see `OPTIMIZATIONS.md` §11, which also records two reverted negatives:
+  `cudaHostRegister` pinning and `MADV_HUGEPAGE`). `#12`: the per-window `ev2d_ntf`
+  buffer (124 MB) is eliminated — the kernel gathers the immutable near-to-far
+  ordering straight from the device-resident `events.node_index_near_to_far`, indexed
+  by the per-slot global event id (`order_2D_index`). See `OPTIMIZATIONS.md` §12.
+- **Correctness:** `#12` is **bit-identical** (the gather reads exactly the rows the
+  old copy held). `LEGACY_KERNEL=1`: **0/1,000,000** vs. sequential, 4 iters /
+  conflicts 1; warp kernel 0/1,000,000; sub100k C and A 0 mismatches.
+
+| Mode | Configuration | Wall time | Detail |
+|------|---------------|----------:|--------|
+| Sequential | single-thread scan | 113.25 s | unchanged |
+| Parallel (Picard, warp kernel) | 10,000 workers × 100 steps/worker | **0.756 s** | 4 iterations, 1 conflict |
+
+**Speedup: 149.8×** (113.25 s → 0.756 s) — up from 130.2× (E5). #12 cut init D2H
+events 73 → 2.5 ms, reshape 9.6 → 5.6 ms/iter, and H2D 24.3 → 17.5 ms/iter.
+
+**Note on the floor:** instrumenting `init_iter_context` showed that at 1M / 4
+iterations the wall is ~half one-time setup (D2H state + first-touch faulting of the
+remaining scratch) and ~half the 4-iteration loop. Faulting can't be sped up here (no
+huge pages), so further wins must shrink the footprint (P13: `worker_inv`) or the loop
+(P9: GPU prep). See `OPTIMIZATIONS.md` "Next steps".

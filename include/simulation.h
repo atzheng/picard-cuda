@@ -38,7 +38,8 @@ __global__ void simulate_worker_kernel(
     // Events for this iteration
     const int* events_product,           // [n_workers, num_steps]
     const int* events_quantity,          // [n_workers, num_steps]
-    const int* events_node_near_to_far,  // [n_workers, num_steps, n_nodes_plus1]
+    const int* event_ntf_full,           // [n_events, n_nodes_plus1] — immutable, device-resident
+    const int* order_2D_index,           // [n_workers, num_steps] — global event idx per slot (-1 if none)
     const float* events_capacity_delta,  // [n_workers, num_steps, n_nodes_plus1]
     const int* valid_mask,               // [n_workers, num_steps]
     const uint64_t* rng_keys,            // [n_workers]
@@ -87,7 +88,9 @@ __global__ void simulate_worker_kernel(
 
         int product = events_product[flat_idx];
         int quantity = events_quantity[flat_idx];
-        const int* node_ntf = events_node_near_to_far + (size_t)flat_idx * n_nodes_plus1;
+        // Index the immutable, device-resident full ntf by this slot's global event
+        // index (valid here: the !valid_mask branch above already `continue`d).
+        const int* node_ntf = event_ntf_full + (size_t)order_2D_index[flat_idx] * n_nodes_plus1;
 
         // Inventory row for this product within this worker
         float* inv_row = inv + (size_t)product * n_nodes_plus1;
@@ -143,7 +146,8 @@ __global__ void simulate_worker_kernel_warp(
     const float* init_capacity,
     const int* events_product,
     const int* events_quantity,
-    const int* events_node_near_to_far,
+    const int* event_ntf_full,           // [n_events, n_nodes_plus1] — immutable, device-resident
+    const int* order_2D_index,           // [n_workers, num_steps] — global event idx per slot
     const float* events_capacity_delta,
     const int* valid_mask,
     const uint64_t* rng_keys,
@@ -189,7 +193,9 @@ __global__ void simulate_worker_kernel_warp(
 
         int product  = events_product[flat_idx];
         int quantity = events_quantity[flat_idx];
-        const int* node_ntf = events_node_near_to_far + (size_t)flat_idx * n_nodes_plus1;
+        // Index the immutable, device-resident full ntf by this slot's global event
+        // index (valid here: the !valid_mask branch above already `continue`d).
+        const int* node_ntf = event_ntf_full + (size_t)order_2D_index[flat_idx] * n_nodes_plus1;
         float* inv_row = inv + (size_t)product * n_nodes_plus1;
 
         uint64_t subkey;

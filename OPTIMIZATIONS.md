@@ -40,6 +40,8 @@ All numbers best-of-3, measured together in a single run for consistency.
 | 8 | Warp-cooperative kernel (tolerance oracle) | 0.160 s | 0.113 s | 1.54× | 3.26× |
 | 9 | O(window) max_t_reset (drop post sort) | 0.144 s | 0.100 s | 1.12× | **3.62×** |
 | 10 | Parallel/persistent capacity-delta scan (P5b) | 0.167 s | 0.108 s | ~flat | 3.62× |
+| 11 | No-init scratch allocator (init cleanup) | 0.144 s | 0.100 s | ~flat | 3.62× |
+| 12 | Eliminate ev2d_ntf — kernel gathers device ntf | 0.141 s | 0.098 s | ~flat | 3.62× |
 
 (#4–#7 and #10 were driven by the **1M-event** workload where `prep` dominates — see
 the "Scaling to 1,000,000 events" section below for the per-step phase breakdown; the
@@ -392,37 +394,70 @@ net-neutral/slightly worse. Reverted. (Would help iteration-heavy configs.)
 is to **fault and upload less** — i.e. shrink the per-window footprint. #12 does that
 by removing the largest scratch buffer outright.
 
+### 12. Eliminate `ev2d_ntf` — kernel gathers the device-resident immutable ntf
+
+**Diagnosis.** Following #11, the wall was ~half one-time cost, and the single
+largest per-window structure was `ev2d_ntf` — the `[n_workers·num_steps · np1]`
+near-to-far ordering for the window (**124 MB at 1M**). Every iteration it was (a)
+built by a 31M-element host copy inside the reshape loop, (b) uploaded H2D (124 MB),
+and (c) its host buffer + the host master copy `h_event_ntf` (another 124 MB, plus a
+124 MB init D2H) all had to be allocated and faulted. But the near-to-far ordering is
+**immutable** and **already device-resident** as `events.node_index_near_to_far`.
+
+**Change.** Don't materialize the per-window ntf at all. The kernel already knows each
+slot's global event index — `order_2D_index` — so it gathers the ntf row straight
+from the device-resident full array: `node_ntf = event_ntf_full + global·np1`. Per
+iteration we now upload only `order_2D_index` (**4 MB**) instead of `ev2d_ntf`
+(124 MB). Removed entirely: the `ev2d_ntf` host buffer, the `h_event_ntf` host copy
+and its init D2H, the reshape ntf-copy loop, and the `d_ev_ntf` device buffer. The
+gathered values are identical (the old `ev2d_ntf` was a copy of exactly these rows),
+so it is **bit-identical**: `LEGACY_KERNEL=1` Picard is **0/1,000,000** vs. sequential
+(4 iters, conflicts 1); warp kernel also 0/1,000,000; sub100k C and A 0 mismatches.
+
+**Result.** init D2H events **73 → 2.5 ms**; reshape **9.6 → 5.6 ms/iter**; H2D
+**24.3 → 17.5 ms/iter**; 1M wall **0.87 → 0.756 s**. Cumulative vs. sequential:
+113.25 s → 0.756 s = **149.8×**. (Footprint also dropped ~248 MB, easing the
+first-touch faulting from #11.)
+
+**Profile after (1M, `PROFILE=1`):**
+```
+[init] D2H events     2.5 ms     [init] D2H state    38.2 ms
+[init] host resizes   0.1 ms     [init] cudaMalloc    0.7 ms
+prep (CPU)     66.3%   114.0 ms/iter   (of which reshape 5.6 ms; incl. iter-1 faulting)
+kernel         16.6%    28.6 ms/iter
+H2D upload     10.1%    17.5 ms/iter
+post (CPU)      6.5%    11.1 ms/iter
+D2H readback    0.5%     0.9 ms/iter
+```
+
 ---
 
 ## Next steps (diagnosed, not yet implemented)
 
-P4–P9, P5b (#10), and the init cleanup (#11) are **done**. After them the 1M profile is:
+P4–P9, P5b (#10), init cleanup (#11), and ntf elimination (#12) are **done**. At
+1M / 4 iterations the **wall (0.756 s) is now roughly half one-time setup and half
+loop**: `init` D2H-state (~38 ms) + first-touch faulting of the remaining ~450 MB
+scratch (folded into iter-1 prep), plus the 4-iteration loop (kernel 28.6, H2D 17.5,
+post 11.1, and the steady-state prep compute ~51 ms/iter). Because faulting can't be
+made cheaper here (no huge pages, #11), the remaining levers are **shrink footprint
+further** and **shrink the loop**. Targets:
 
-```
-prep (CPU)     44.8%    51.2 ms/iter   <-- still top, but H2D + kernel now comparable
-kernel         25.5%    29.2 ms/iter
-H2D upload     19.8%    22.6 ms/iter
-post (CPU)      9.7%    11.1 ms/iter
-D2H readback    0.3%     0.3 ms/iter
-```
-
-Prep is no longer the runaway bottleneck — kernel (25.5%), H2D (19.8%) and the
-remaining prep (44.8%) are now within ~2× of each other, so the next win is smaller
-and more spread out. Targets in priority order:
+### P13 — Shrink `worker_inv` (largest remaining buffer, 124 MB)
+`worker_inv` is now the biggest per-window structure and H2D payload. Like #12, the
+inventory rows are device-resident (`state.inventory`) — but unlike ntf they mutate,
+so the kernel can't index them blindly. Options: keep inventory resident on the GPU
+and apply only the small committed `[t_reset,new_t_reset)` delta each iteration, or a
+compact `(worker,pid)`→row layout that uploads only touched rows.
 
 ### P5c — Remaining serial prep (Fisher–Yates shuffle)
-The cumsum scan and the assignment scatter are now parallel; the serial pieces left
-in prep are `cum_count` (O(window), ~2 ms — cheap) and the **Fisher–Yates shuffle**
-in `random_assignment` (`O(n_products)` ≈ 567K, serial RNG chain). Parallelizing the
-shuffle needs a different permutation algorithm, which changes the worker assignment
-and so must be re-validated against the decision tolerance.
-
-### H2D (19.8%) — compact/pinned `worker_inv` upload
-Now the #2 phase. The 12.7 MB `worker_inv` upload per iteration is mostly dead rows;
-a compact per-window layout or pinned host memory shrinks it.
+The cumsum scan and assignment scatter are parallel; the serial pieces left in prep
+are `cum_count` (O(window), ~2 ms — cheap) and the **Fisher–Yates shuffle** in
+`random_assignment` (`O(n_products)` ≈ 567K, serial RNG chain). Parallelizing it needs
+a different permutation algorithm, which changes the assignment and so must be
+re-validated against the decision tolerance.
 
 ### P9 — Move prep onto the GPU (architectural, highest ceiling)
-prep is ~66% of runtime and is pure array transforms (gather/scatter, counting,
+prep is the bulk of the loop and is pure array transforms (gather/scatter, counting,
 cumsum) on data already bound for the device. Porting it to CUDA removes the CPU
 from the hot path entirely. Largest effort.
 
@@ -437,5 +472,7 @@ per-window layout or pinned host memory shrinks it.
 | +#4–#7 | 1.77 s | bit-identical, 64.1× vs sequential |
 | +#8 warp kernel | 1.37 s | tolerance oracle (0 mismatches), 82.8× |
 | +#9 post O(window) | 1.09 s | exact; 104.2× vs sequential |
-| **+#10 P5b prep scan (done)** | **0.870 s** | **exact; 130.2× vs sequential** |
-| +H2D / P9 (prep on GPU) | toward 0.5 s | compact upload / GPU-port prep |
+| +#10 P5b prep scan | 0.870 s | exact; 130.2× vs sequential |
+| +#11 init no-init scratch | 0.870 s | wall-neutral (faulting floor) |
+| **+#12 eliminate ev2d_ntf (done)** | **0.756 s** | **exact; 149.8× vs sequential** |
+| +P13 / P9 (shrink worker_inv / GPU prep) | toward 0.5 s | less H2D+footprint / GPU-port |
