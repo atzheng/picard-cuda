@@ -65,3 +65,28 @@ PY
 python -c "import numpy as np; a=np.load('/tmp/seq1m_fulfill.npy'); \
 b=np.load('/tmp/par1m_fulfill.npy'); print('identical:', np.array_equal(a,b))"
 ```
+
+---
+
+## E2 — Same workload after host optimizations #4–#7
+
+- **Commit:** _(this commit)_ — O(n) `cum_count`, persistent prep buffers,
+  `get_slice` as contiguous copies, and OpenMP across the prep loops.
+  See `OPTIMIZATIONS.md` §"Scaling to 1,000,000 events".
+- **Workload / seed / oracle:** identical to E1 (`data/sub1m/npy`, seed 42).
+
+| Mode | Configuration | Wall time | Detail |
+|------|---------------|----------:|--------|
+| Sequential | single-thread scan | 113.25 s | unchanged from E1 |
+| Parallel (Picard) | 10,000 workers × 100 steps/worker | **1.77 s** | 4 iterations, 1 conflict |
+
+**Speedup: 64.1×** (113.25 s → 1.77 s) — up from 35.6× in E1; the host
+optimizations alone took the parallel run **3.18 s → 1.77 s (1.8×)**.
+
+**Correctness:** bit-identical — 1,000,000 fulfillments, **0 mismatches**.
+
+**Phase profile (`PROFILE=1`, per iteration):** kernel 152.8 ms (42.6%), prep
+119.7 ms (33.3%), post 63.5 ms (17.7%), H2D 22.7 ms (6.3%), D2H 0.3 ms. `prep`
+fell from 491 → 120 ms/iter; the **kernel is now the dominant phase** (its absolute
+cost is unchanged — the host work around it shrank). Next targets in
+`OPTIMIZATIONS.md` → "Next steps" (P8 warp kernel, P-post, P9 GPU prep).

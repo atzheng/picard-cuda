@@ -35,35 +35,32 @@ inline void argsort(const int* data, int* indices, int n) {
 // cum_count: for each i, count how many j < i have x[j] == x[i]
 // Equivalent to JAX's cum_count function
 // x values must be in [0, numel)
-inline void cum_count(const int* x, int n, int numel, int* result) {
-    // rank[i] = position of i in stable argsort of x
-    std::vector<int> sorted_indices(n);
-    argsort(x, sorted_indices.data(), n);
-
-    std::vector<int> rank(n);
-    for (int i = 0; i < n; i++) {
-        rank[sorted_indices[i]] = i;
+//
+// A single forward pass with a per-value running counter gives the identical
+// result to the previous stable-sort + rank - n_less formulation: rank[i] minus
+// the number of strictly-smaller elements is exactly i's position within its
+// equal-value group in stable order, i.e. how many earlier j share x[i]. This is
+// O(n) (was O(n log n) from a full stable_sort of n) and bit-identical (integer).
+// `counts` is an optional caller-provided scratch buffer of size >= numel to
+// avoid a per-call allocation; pass nullptr to allocate internally.
+inline void cum_count(const int* x, int n, int numel, int* result,
+                      int* counts = nullptr) {
+    std::vector<int> owned;
+    int* cnt;
+    if (counts) {
+        cnt = counts;
+        std::fill(cnt, cnt + numel, 0);
+    } else {
+        owned.assign(numel, 0);
+        cnt = owned.data();
     }
-
-    // bincounts[v] = number of occurrences of v in x
-    std::vector<int> bincounts(numel + 1, 0);  // +1 for safety
     for (int i = 0; i < n; i++) {
-        if (x[i] >= 0 && x[i] < numel) bincounts[x[i]]++;
-    }
-
-    // cum_bincounts[v] = sum of bincounts[0..v-1]
-    // cum_bincounts[-1] = 0 (we handle via x[i]-1 indexing)
-    std::vector<int> cum_bincounts(numel + 1, 0);
-    for (int i = 1; i <= numel; i++) {
-        cum_bincounts[i] = cum_bincounts[i - 1] + bincounts[i - 1];
-    }
-    // n_less[i] = cum_bincounts[x[i]] (number of elements strictly less than x[i])
-    // But JAX does cum_bincounts[x-1], which with the append trick gives
-    // cum_bincounts[x[i]-1] for x[i]>=1, and 0 for x[i]==0
-    // Actually: n_less[i] = cum_bincounts[x[i]] gives count of vals < x[i]
-    for (int i = 0; i < n; i++) {
-        int n_less = cum_bincounts[x[i]];
-        result[i] = rank[i] - n_less;
+        int v = x[i];
+        if (v >= 0 && v < numel) {
+            result[i] = cnt[v]++;
+        } else {
+            result[i] = 0;
+        }
     }
 }
 
@@ -132,6 +129,10 @@ inline void compute_capacity_delta_other_threads(
     // cap_deltas[w][s] = caps[w][s] - caps[w][s-1]  (with caps[w][-1] = 0)
     // cap_deltas_by_product[w][s] = -one_hot_fulfill[order_2D_index[w][s]]
     // result = -(cap_deltas - cap_deltas_by_product)
+    // The cumsum above is a serial prefix scan, but this gather is independent per
+    // worker w, so parallelize the outer loop (each w writes a disjoint output
+    // block; float ops per element are unchanged -> bit-identical).
+    #pragma omp parallel for schedule(static)
     for (int w = 0; w < n_workers; w++) {
         for (int s = 0; s < num_steps; s++) {
             int idx = order_2D_index[w * num_steps + s];

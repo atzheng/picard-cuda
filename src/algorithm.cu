@@ -208,8 +208,19 @@ struct IterContext {
     std::vector<float> h_inventory;
     std::vector<int>   h_fulfill;
 
-    // Persistent host scratch (sized once, refilled each iteration).
+    // Persistent host scratch (sized once in init, refilled each iteration —
+    // avoids ~15 heap allocations per Picard iteration and gives OpenMP stable
+    // buffers to write into).
+    int eff_num_steps = 0;
     std::vector<float> worker_inv;
+    std::vector<int> slice_products, slice_quantities, slice_fulfill;
+    std::vector<int> product_worker_map, product_ids_within_worker;
+    std::vector<int> workers, index_within_worker, cum_counts;
+    std::vector<int> order_2D_index, valid_mask, order_2D_relative;
+    std::vector<float> capacity_delta;
+    std::vector<int> ev2d_product, ev2d_quantity, ev2d_ntf;
+    std::vector<uint64_t> worker_keys;
+    std::vector<int> fulfill_2D, order_flat;
 
     // Persistent device scratch (allocated once, reused each iteration).
     float* d_worker_inv = nullptr;
@@ -266,6 +277,30 @@ static void init_iter_context(
     ctx.prof.on = (getenv("PROFILE") != nullptr);
 
     ctx.worker_inv.assign((size_t)ctx.n_workers * ctx.max_ppw * np1, 0.0f);
+
+    // Size persistent prep scratch once. eff_num_steps and the window dims depend
+    // only on config + n_events, so they are fixed across the whole loop.
+    ctx.eff_num_steps = std::min(ctx.num_steps * ctx.n_workers, ctx.n_events);
+    int ens = ctx.eff_num_steps;
+    size_t evc = ctx.ev_count;
+    ctx.slice_products.resize(ens);
+    ctx.slice_quantities.resize(ens);
+    ctx.slice_fulfill.resize(ens);
+    ctx.product_worker_map.resize(ctx.n_products);
+    ctx.product_ids_within_worker.resize(ctx.n_products);
+    ctx.workers.resize(ens);
+    ctx.index_within_worker.resize(ens);
+    ctx.cum_counts.resize(ctx.n_workers);
+    ctx.order_2D_index.resize(evc);
+    ctx.valid_mask.resize(evc);
+    ctx.order_2D_relative.resize(evc);
+    ctx.capacity_delta.resize(evc * np1);
+    ctx.ev2d_product.resize(evc);
+    ctx.ev2d_quantity.resize(evc);
+    ctx.ev2d_ntf.resize(evc * np1);
+    ctx.worker_keys.resize(ctx.n_workers);
+    ctx.fulfill_2D.resize(evc);
+    ctx.order_flat.resize(evc);
 
     // Per-iteration buffer sizes depend only on config dims, so allocate once.
     size_t inv_bytes = (size_t)ctx.n_workers * ctx.max_ppw * np1 * sizeof(float);
@@ -326,49 +361,63 @@ static void iterate_core(
     PhaseProf& prof = ctx.prof;
     double tp = prof.on ? prof_now() : 0.0;
 
+    // Bind persistent scratch (allocated once in init_iter_context).
+    std::vector<int>& slice_products = ctx.slice_products;
+    std::vector<int>& slice_quantities = ctx.slice_quantities;
+    std::vector<int>& slice_fulfill = ctx.slice_fulfill;
+    std::vector<int>& product_worker_map = ctx.product_worker_map;
+    std::vector<int>& product_ids_within_worker = ctx.product_ids_within_worker;
+    std::vector<int>& workers = ctx.workers;
+    std::vector<int>& index_within_worker = ctx.index_within_worker;
+    std::vector<int>& order_2D_index = ctx.order_2D_index;
+    std::vector<int>& valid_mask = ctx.valid_mask;
+    std::vector<int>& order_2D_relative = ctx.order_2D_relative;
+    std::vector<float>& capacity_delta = ctx.capacity_delta;
+    std::vector<int>& ev2d_product = ctx.ev2d_product;
+    std::vector<int>& ev2d_quantity = ctx.ev2d_quantity;
+    std::vector<int>& ev2d_ntf = ctx.ev2d_ntf;
+
     // --- Step 1: Build 2D event structure ---
-    int eff_num_steps = std::min(num_steps * n_workers, n_events);
+    int eff_num_steps = ctx.eff_num_steps;
     int t0 = std::min(algo_state.t_reset, n_events - eff_num_steps);
-    int roll_amount = -(algo_state.t_reset - t0);
 
-    // get_slice: extract [t0, t0+eff_num_steps) and roll
+    // get_slice: extract [t0, t0+eff_num_steps) and roll by (t_reset - t0). The
+    // roll is a rotation, so emit it as two contiguous copies instead of a
+    // per-element double modulo (P7): out[0..eff-k) = arr[t0+k..t0+eff),
+    // out[eff-k..eff) = arr[t0..t0+k), with k = (t_reset - t0) mod eff.
+    int k = (algo_state.t_reset - t0) % eff_num_steps;
     auto get_slice_int = [&](const std::vector<int>& arr, std::vector<int>& out) {
-        out.resize(eff_num_steps);
-        for (int i = 0; i < eff_num_steps; i++) {
-            int src = ((i - roll_amount) % eff_num_steps + eff_num_steps) % eff_num_steps;
-            out[i] = arr[t0 + src];
-        }
+        std::copy(arr.begin() + t0 + k, arr.begin() + t0 + eff_num_steps, out.begin());
+        std::copy(arr.begin() + t0, arr.begin() + t0 + k, out.begin() + (eff_num_steps - k));
     };
-
-    std::vector<int> slice_products(eff_num_steps);
-    std::vector<int> slice_quantities(eff_num_steps);
-    std::vector<int> slice_fulfill(eff_num_steps);
     get_slice_int(h_event_products, slice_products);
     get_slice_int(h_event_quantities, slice_quantities);
     get_slice_int(h_fulfill, slice_fulfill);
 
-    // Random assignment of products to workers
+    // Random assignment of products to workers (Fisher-Yates is inherently serial)
     uint64_t key = algo_state.rng_key;
     uint64_t subkey;
     split_key(key, key, subkey);
 
-    std::vector<int> product_worker_map(n_products);
-    std::vector<int> product_ids_within_worker(n_products);
     random_assignment(subkey, n_products, n_workers, max_ppw,
                       product_worker_map.data(), product_ids_within_worker.data());
 
     // Map events to workers
-    std::vector<int> workers(eff_num_steps);
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < eff_num_steps; i++) {
         workers[i] = product_worker_map[slice_products[i]];
     }
 
-    // cum_count within workers
-    std::vector<int> index_within_worker(eff_num_steps);
-    cum_count(workers.data(), eff_num_steps, n_workers, index_within_worker.data());
+    // cum_count within workers (O(n) running counter; serial dependency, uses
+    // persistent scratch). Fast enough that parallelizing is unnecessary.
+    cum_count(workers.data(), eff_num_steps, n_workers, index_within_worker.data(),
+              ctx.cum_counts.data());
 
-    // Build order_2D_index: [n_workers, num_steps]
-    std::vector<int> order_2D_index(n_workers * num_steps, -1);
+    // Build order_2D_index: [n_workers, num_steps]. cum_count guarantees a unique
+    // step s per worker, so every (w,s) target is written at most once -> the
+    // scatter is race-free and parallelizable. Reset to -1 first (persistent buf).
+    std::fill(order_2D_index.begin(), order_2D_index.end(), -1);
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < eff_num_steps; i++) {
         int w = workers[i];
         int s = index_within_worker[i];
@@ -377,30 +426,20 @@ static void iterate_core(
         }
     }
 
-    // Valid mask
-    std::vector<int> valid_mask(n_workers * num_steps, 0);
+    // Valid mask + relative indices (independent per element)
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < n_workers * num_steps; i++) {
-        valid_mask[i] = (order_2D_index[i] >= 0 && order_2D_index[i] < n_events) ? 1 : 0;
+        int v = (order_2D_index[i] >= 0 && order_2D_index[i] < n_events) ? 1 : 0;
+        valid_mask[i] = v;
+        order_2D_relative[i] = v ? (order_2D_index[i] - algo_state.t_reset) : -1;
     }
 
-    // Compute capacity deltas (indices relative to the slice window)
-    std::vector<int> order_2D_relative(n_workers * num_steps);
-    for (int i = 0; i < n_workers * num_steps; i++) {
-        order_2D_relative[i] = valid_mask[i] ? (order_2D_index[i] - algo_state.t_reset) : -1;
-    }
-
-    std::vector<float> capacity_delta(n_workers * num_steps * np1, 0.0f);
     compute_capacity_delta_other_threads(
         np1, slice_fulfill.data(), slice_quantities.data(),
         order_2D_relative.data(), n_workers, num_steps, eff_num_steps,
         capacity_delta.data());
 
     // --- Step 2: Build event arrays for the kernel ---
-    // events_2D: product (within worker), quantity, node_near_to_far, capacity_delta
-    std::vector<int> ev2d_product(n_workers * num_steps);
-    std::vector<int> ev2d_quantity(n_workers * num_steps);
-    std::vector<int> ev2d_ntf(n_workers * num_steps * np1);
-
     // Window-scoped inventory reshape. The kernel only ever reads the inventory
     // row of a (worker, pid) slot that a VALID event maps to, so we scatter just
     // those rows — one per valid event, O(window) — instead of all n_products
@@ -410,6 +449,10 @@ static void iterate_core(
     double tr = prof.on ? prof_now() : 0.0;
     std::vector<float>& worker_inv = ctx.worker_inv;
 
+    // Independent per slot i. Two valid events that share a product map to the
+    // same worker_inv (w,pid) row, but they also share the same source inventory
+    // row, so the (identical-value) overlapping writes are race-free for results.
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < n_workers * num_steps; i++) {
         int idx = order_2D_index[i];
         if (valid_mask[i]) {
@@ -435,8 +478,8 @@ static void iterate_core(
 
     if (prof.on) prof.reshape += prof_now() - tr;
 
-    // Prepare RNG keys for workers
-    std::vector<uint64_t> worker_keys(n_workers);
+    // Prepare RNG keys for workers (split_key chains serially)
+    std::vector<uint64_t>& worker_keys = ctx.worker_keys;
     uint64_t wk = algo_state.rng_key;
     for (int w = 0; w < n_workers; w++) {
         split_key(wk, wk, worker_keys[w]);
@@ -477,14 +520,14 @@ static void iterate_core(
     if (prof.on) { prof.kernel += prof_now() - tp; tp = prof_now(); }
 
     // Read back fulfill_2D
-    std::vector<int> fulfill_2D(ev_count);
+    std::vector<int>& fulfill_2D = ctx.fulfill_2D;
     CUDA_CHECK(cudaMemcpy(fulfill_2D.data(), ctx.d_fulfill_2D, ev_count * sizeof(int), cudaMemcpyDeviceToHost));
 
     if (prof.on) { prof.d2h += prof_now() - tp; tp = prof_now(); }
 
     // --- Step 4: Compute max_t_reset from contiguity of order_2D_index ---
     // (order_flat is window-sized: n_workers * num_steps entries.)
-    std::vector<int> order_flat(n_workers * num_steps);
+    std::vector<int>& order_flat = ctx.order_flat;
     std::copy(order_2D_index.begin(), order_2D_index.end(), order_flat.begin());
     std::sort(order_flat.begin(), order_flat.end());
 

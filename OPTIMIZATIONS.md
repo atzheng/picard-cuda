@@ -35,7 +35,12 @@ All numbers best-of-3, measured together in a single run for consistency.
 | 0 | Baseline (original)        | 0.521 s | 0.285 s | —     | 1.00× |
 | 1 | State-resident host loop   | 0.372 s | 0.252 s | 1.40× | 1.40× |
 | 2 | Window-scoped inventory reshape | 0.303 s | 0.236 s | 1.23× | 1.72× |
-| 3 | Window-scoped conflict/commit   | 0.296 s | 0.232 s | 1.02× | **1.76×** |
+| 3 | Window-scoped conflict/commit   | 0.296 s | 0.232 s | 1.02× | 1.76× |
+| 4–7 | O(n) cum_count + persistent buffers + get_slice copies + OpenMP | 0.247 s | 0.200 s | 1.20× | **2.11×** |
+
+(#4–#7 were driven by the **1M-event** workload where `prep` dominates — see the
+"Scaling to 1,000,000 events" section below for the per-step phase breakdown; the
+sub100k columns here are the cross-check that they stay bit-identical and still help.)
 
 ---
 
@@ -171,86 +176,118 @@ post (CPU)      6.8%
 
 ---
 
+## Scaling to 1,000,000 events (#4–#7)
+
+Optimizations #1–#3 were tuned on the host-heavy sub100k Config C. At the
+realistic **1M-event** workload (`data/sub1m/npy`, 567,323 products, 10,000
+workers × 100 steps, 4 iterations — see `experiments.md`) `prep` (single-threaded
+CPU) was **67.6%** of runtime while 23 host cores and the A100 sat idle. #4–#7
+attack that. Starting point is commit `54dcf3e` (i.e. #1–#3 already in): **3.16 s**.
+
+| # | Optimization | prep ms/iter | 1M wall | sub100k C | sub100k A |
+|---|--------------|-------------:|--------:|----------:|----------:|
+| 3 | (starting point, #1–#3) | 491 | 3.16 s | 0.296 s | 0.232 s |
+| 4 | O(n) `cum_count`        | 407 | 2.83 s |    —     |    —     |
+| 5–7 | persistent buffers + `get_slice` copies + OpenMP | **120** | **1.77 s** | **0.247 s** | **0.200 s** |
+
+**Cumulative vs. sequential (1M):** 113.25 s → **1.77 s = 64.1×** (was 35.6× at
+`54dcf3e`). All steps **bit-identical** to the sequential scan (0 mismatches);
+iteration counts unchanged.
+
+### 4. O(n) `cum_count` (drop the 1M-element `stable_sort`)
+
+**Diagnosis.** `cum_count` (`utils.h`) computes, per event, how many earlier
+events share its worker — via a full `std::stable_sort` of all `eff_num_steps`
+(1M) elements plus rank/bincount passes. A microbench put that sort at **93.3 ms**
+of the 491 ms prep.
+
+**Change.** The same value is a one-pass running counter:
+`result[i] = count[workers[i]]++` over an `O(n_workers)` array. Integer →
+bit-identical. Microbench: **93.3 ms → 2.3 ms (41×)** on the sub-step.
+
+**Result.** prep 491 → 407 ms/iter; 1M wall 3.16 → 2.83 s. 0 mismatches.
+
+### 5–7. Persistent buffers + `get_slice` copies + OpenMP
+
+Three changes, landed and measured together (they interlock — OpenMP needs the
+stable buffers, and the per-element loops are the parallel targets):
+
+- **#6 Persistent scratch.** ~15 `O(window)`/`O(n_products)` vectors were
+  heap-allocated every `iterate_core` call (`slice_*`, `product_*`, `order_2D_*`,
+  `valid_mask`, `capacity_delta`, `ev2d_*`, `fulfill_2D`, `order_flat`, …). Hoisted
+  into `IterContext`, sized once, reused. Removes per-iteration alloc + zero-fill +
+  page-fault churn and gives OpenMP fixed buffers to write into.
+- **#7 `get_slice` as two copies.** The window roll was a per-element double
+  modulo over three 1M arrays (6M `%`/iter). It is a rotation, so it is now two
+  contiguous `std::copy` ranges (`k = (t_reset − t0) mod eff`).
+- **#5 OpenMP over prep.** `#pragma omp parallel for` on the embarrassingly
+  parallel prep loops (24 cores): event→worker map, `order_2D_index` scatter
+  (unique `(w,s)` ⇒ race-free), `valid_mask`/`order_2D_relative`, the inventory
+  reshape/event-build, and the **outer `w` loop** of `compute_capacity_delta`.
+  The cumsum prefix scan inside it stays **serial** (a parallel scan would reorder
+  float adds and break bit-identicality); only the independent gather is
+  parallelized. `cum_count` (now O(n), ~2 ms) and the Fisher–Yates shuffle stay
+  serial. Built with `-Xcompiler -fopenmp` (CMake `OpenMP::OpenMP_CXX`).
+
+**Result.** prep 407 → **120 ms/iter** (3.4×); reshape 69 → 10 ms/iter; 1M wall
+2.83 → **1.77 s**. sub100k C 0.296 → 0.247 s, A 0.232 → 0.200 s. 0 mismatches,
+iteration counts unchanged.
+
+**Profile after (1M, `PROFILE=1`):**
+```
+kernel         42.6%   152.8 ms/iter   <-- now the top phase
+prep (CPU)     33.3%   119.7 ms/iter
+post (CPU)     17.7%    63.5 ms/iter   (dominated by a 1M-element std::sort)
+H2D upload      6.3%    22.7 ms/iter
+D2H readback    0.1%     0.3 ms/iter
+```
+
+---
+
 ## Next steps (diagnosed, not yet implemented)
 
-### The bottleneck inverts at scale
-
-The Config-C "next steps" below were diagnosed on a deliberately host-heavy
-*small-window* config. At the **realistic 1M-event scale** (`data/sub1m/npy`,
-10,000 workers × 100 steps, 4 iterations — see `experiments.md` E1), the phase mix
-is completely different:
+P4–P7 are **done** (see #4–#7 above). After them the 1M profile is:
 
 ```
-prep (CPU)     67.6%   491.3 ms/iter   <-- now totally dominant
-  of which reshape  10.1%  73.8 ms/iter
-kernel         21.0%   152.6 ms/iter
-post (CPU)      8.3%    60.7 ms/iter
-H2D upload      2.8%    20.5 ms/iter
-D2H readback    0.3%     2.1 ms/iter
+kernel         42.6%   152.8 ms/iter   <-- now the top phase (unchanged in abs.)
+prep (CPU)     33.3%   119.7 ms/iter
+post (CPU)     17.7%    63.5 ms/iter
+H2D upload      6.3%    22.7 ms/iter
+D2H readback    0.1%     0.3 ms/iter
 ```
 
-**`prep` is 67.6% and it is single-threaded CPU work running while a 24-core host
-and an A100 sit idle.** That, not the kernel, is where the next "faster relative to
-sequential" wins are. Plan, in priority order:
+### P8 — Warp-parallel kernel (now the top phase, 42.6%)
+Launched `<<<n_workers, 1>>>` — one thread per block, so 31/32 of each warp is idle
+and the per-event NN inference runs fully serial. A warp-per-worker design
+parallelizes the per-event matvec/feasibility scan. **Caveat:** changes the NN's
+floating-point reduction order → breaks the *bit-identical* oracle; needs a
+tolerance-based oracle or a fixed reduction order first. Highest payoff now,
+highest care. **Needs a product decision on the oracle before starting.**
 
-### P4 — O(n) `cum_count` (replace the 1M-element `stable_sort`) — *do first*
-`cum_count` (utils.h) computes, for each event, how many earlier events share its
-worker — currently via a **full `std::stable_sort` of all `eff_num_steps` (1M)
-elements** plus rank/bincount passes. That sort is the single biggest sub-cost.
-The same result is a one-pass running counter: `result[i] = count[workers[i]]++`
-over an `O(n_workers)` counter array. **Integer math → bit-identical.**
-- **Measured (microbench, 1M events):** stable_sort path **93.3 ms** → counter
-  path **2.3 ms** = **41× on this sub-step**, ~91 ms/iter saved (~19% of total
-  runtime, ~0.36 s off the 3.16 s wall at 4 iterations).
-- Risk: none. Drop-in, integer, exact. **Highest ROI / lowest risk — start here.**
+### P-post — Drop the 1M-element `std::sort` in `post` (17.7%)
+`post` is now dominated by sorting `order_flat` (all `n_workers·num_steps` global
+indices) every iteration just to find `max_t_reset` — the same "needless sort"
+pattern P4 removed from prep. Event 0 always maps to `t_reset`, so the contiguous
+run starts there; an `O(window)` "present" bitmap over `[t_reset, t_reset+eff)` +
+a first-gap scan replaces the `O(window log window)` sort. Integer; must reproduce
+`max_t_reset` exactly — verify against the sort on the trajectory before trusting.
 
-### P5 — OpenMP across prep's element-wise loops (24 idle cores)
-After P4, the remaining ~400 ms/iter of prep is mostly embarrassingly parallel
-per-element work: the three `get_slice` loops, the worker mapping, `valid_mask`,
-`order_2D_relative`, `order_2D_index` (writes are unique per `(w,s)` so no race),
-the event-build + inventory-scatter loop, and the **outer `w` loop of
-`compute_capacity_delta`**. All integer or independent-row float → bit-identical
-under `#pragma omp parallel for`.
-- **Caveat:** the *cumsum* (prefix scan) inside `compute_capacity_delta` is a
-  sequential dependency; keep it serial (or use a parallel scan, which reorders
-  float adds and would break bit-identicality). Parallelize only the gather/diff
-  loop that follows it.
-- **Estimated:** if ~75% of post-P4 prep parallelizes at ~8×, prep drops from
-  ~400 to ~140 ms/iter — the largest single remaining win.
-
-### P6 — Persistent prep scratch buffers
-Every `iterate_core` call heap-allocates ~15 vectors sized `O(window)` /
-`O(n_products)` (`slice_*`, `product_worker_map`, `workers`, `order_2D_*`,
-`valid_mask`, `capacity_delta`, `ev2d_*`, …). Hoist them into `IterContext`,
-allocate once, reuse. Removes per-iteration allocator + zero-fill + page-fault
-cost, and is a **prerequisite for P5** (stable buffers to parallelize over).
-
-### P7 — Strength-reduce `get_slice` (kill the double modulo)
-`get_slice_int` does two `%` per element across three 1M arrays (6M modulos/iter).
-The roll is a rotation: emit it as two contiguous `std::copy` ranges instead.
-Integer, exact, easy.
-
-### P8 — Warp-parallel kernel (now only 21%, but the next ceiling after prep)
-Kernel is launched `<<<n_workers, 1>>>` (one thread/block; 31/32 of each warp
-idle). A warp-per-worker design parallelizes the per-event NN matvec/feasibility
-scan. **Caveat (unchanged):** changes float reduction order → breaks the
-bit-identical oracle; needs a tolerance oracle or a fixed reduction order first.
-Deprioritized vs. prep because it is only 21% at scale.
+### P5b — OpenMP / parallel-scan the `compute_capacity_delta` cumsum
+The serial prefix scan is the remaining un-parallelized chunk of prep. A
+blocked parallel scan would speed it up but reorders float adds (bit-identicality
+risk); gated on the same oracle decision as P8.
 
 ### P9 — Move prep onto the GPU (architectural, highest ceiling)
-Since prep is 68% and pure array transforms (gather/scatter, counting, cumsum) on
-data that is *already going to the device*, porting it to CUDA removes the CPU from
-the hot path entirely. Largest effort and the cumsum carries the same float-order
-risk as P5; sequence it after P4–P7 have proven the host-side wins.
+prep is still 33% of runtime and is pure array transforms (gather/scatter,
+counting, cumsum) on data already bound for the device. Porting it to CUDA removes
+the CPU from the hot path entirely. Largest effort; cumsum carries the same
+float-order risk as P5b.
 
-### Projected trajectory (1M-event wall clock, 3.16 s today)
-| Step | prep ms/iter | est. wall | note |
-|------|-------------:|----------:|------|
-| now (54dcf3e) | 491 | 3.16 s | — |
-| +P4 | ~400 | ~2.8 s | bit-identical, trivial |
-| +P5/P6/P7 | ~140 | ~1.8 s | bit-identical, OpenMP |
-| +P8 (kernel) | ~140 | ~1.4 s | needs oracle change |
-| +P9 (GPU prep) | — | well under 1 s | architectural |
-
-(Estimates are back-of-envelope from the phase profile; each will be measured and
-logged as an entry above when implemented.)
+### Projected trajectory (1M-event wall clock)
+| Step | wall | note |
+|------|-----:|------|
+| `54dcf3e` (#1–#3) | 3.16 s | starting point |
+| **+#4–#7 (done)** | **1.77 s** | **bit-identical, 64.1× vs sequential** |
+| +P-post | ~1.5 s | bit-identical (verify max_t_reset) |
+| +P8 (kernel) | ~1.0 s | needs oracle change |
+| +P9 (GPU prep) | well under 1 s | architectural |
