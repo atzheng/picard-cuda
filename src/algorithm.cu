@@ -927,17 +927,20 @@ __global__ void bench_dynamics_only_kernel_warp(
     if (lane < np1) capacity[lane] = cap[lane];
 }
 
-// 2. NN only: run NN inference per event, write output norm to fulfill (as dummy).
-//    No state update — measures pure NN throughput.
-__global__ void bench_nn_only_kernel(
+// 2. Policy only: NN forward pass + greedy-cost dispatch per event.
+//    No state update — measures the full policy decision cost.
+__global__ void bench_policy_kernel(
     const float* nn_params,
     const int* nn_layer_sizes,
     int nn_num_layers,
     const float* inventory,        // [n_products, n_nodes_plus1] — read only
+    const float* capacity,         // [n_nodes_plus1] — read only
     const int* event_products,     // [n_steps]
+    const int* event_quantities,   // [n_steps]
+    const int* event_ntf,          // [n_steps, n_nodes_plus1]
     int n_steps,
     int n_nodes_plus1,
-    int* fulfill                   // dummy output
+    int* fulfill
 ) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
@@ -947,15 +950,39 @@ __global__ void bench_nn_only_kernel(
 
     for (int i = 0; i < n_steps; i++) {
         int product = event_products[i];
+        int quantity = event_quantities[i];
+        const int* node_ntf = event_ntf + (size_t)i * n_nodes_plus1;
         const float* inv_row = inventory + (size_t)product * n_nodes_plus1;
 
-        nn_predict(nn_params, nn_layer_sizes, nn_num_layers,
-                   inv_row, nn_output, scratch_a, scratch_b);
+        fulfill[i] = fulfillment_greedy_cost(
+            nn_params, nn_layer_sizes, nn_num_layers,
+            inv_row, capacity, quantity,
+            node_ntf, n_nodes_plus1,
+            scratch_a, scratch_b, nn_output);
+    }
+}
 
-        // Write something to prevent the compiler from optimizing away the NN
-        float norm = 0.0f;
-        for (int j = 0; j < n_nodes_plus1; j++) norm += nn_output[j] * nn_output[j];
-        fulfill[i] = (int)(norm * 1e6f);
+// 2b. State update only: replay pre-computed fulfillment decisions,
+//     applying just the inventory and capacity decrements.
+__global__ void bench_state_update_kernel(
+    float* inventory,              // [n_products, n_nodes_plus1] — modified
+    float* capacity,               // [n_nodes_plus1] — modified
+    const int* event_products,     // [n_steps]
+    const int* event_quantities,   // [n_steps]
+    const int* precomputed_fulfill,// [n_steps] — pre-computed node decisions
+    int n_steps,
+    int n_nodes_plus1
+) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    for (int i = 0; i < n_steps; i++) {
+        int product = event_products[i];
+        float q = (float)event_quantities[i];
+        int node = precomputed_fulfill[i];
+        float* inv_row = inventory + (size_t)product * n_nodes_plus1;
+
+        inv_row[node] -= q;
+        capacity[node] -= q;
     }
 }
 
@@ -1064,13 +1091,12 @@ void run_benchmark(
         check_against_baseline("dynamics-warp check");
     }
 
-    // 2. NN only
-    run_timed("nn-only", [&](float* inv, float* cap, int* ful) {
-        (void)cap; // unused
-        bench_nn_only_kernel<<<1, 1>>>(
+    // 2. Policy only (NN + greedy-cost dispatch, no state update)
+    run_timed("policy", [&](float* inv, float* cap, int* ful) {
+        bench_policy_kernel<<<1, 1>>>(
             nn.params, nn.layer_sizes, nn.num_layers,
-            inv,  // read-only, but we pass the copy for consistency
-            events.product,
+            inv, cap,
+            events.product, events.quantity, events.node_index_near_to_far,
             n_steps, np1, ful);
     });
 
@@ -1082,6 +1108,32 @@ void run_benchmark(
             events.product, events.quantity, events.node_index_near_to_far,
             n_steps, np1, algo_state.rng_key, ful);
     });
+
+    // 4. State update only (replay full's fulfillment decisions)
+    //    Run full first to get the decisions, then time just the decrements.
+    {
+        // Get fulfillment decisions from a full run
+        int* d_precomputed;
+        CUDA_CHECK(cudaMalloc(&d_precomputed, n_steps * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_inv_copy, algo_state.inventory, inv_bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(d_cap_copy, algo_state.capacity, cap_bytes, cudaMemcpyDeviceToDevice));
+        simulate_sequential_kernel<<<1, 1>>>(
+            nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
+            d_inv_copy, d_cap_copy,
+            events.product, events.quantity, events.node_index_near_to_far,
+            n_steps, np1, algo_state.rng_key, d_precomputed);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        run_timed("state-update", [&](float* inv, float* cap, int* ful) {
+            (void)ful;
+            bench_state_update_kernel<<<1, 1>>>(
+                inv, cap,
+                events.product, events.quantity, d_precomputed,
+                n_steps, np1);
+        });
+
+        cudaFree(d_precomputed);
+    }
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
