@@ -962,6 +962,104 @@ __global__ void bench_policy_kernel(
     }
 }
 
+// 2c. Policy only, WARP-PARALLEL: one warp (32 lanes) splits each event's MLP
+//     matvec across lanes and does the logsumexp/norm reductions with warp
+//     shuffles — the same scheme as simulate_worker_kernel_warp's use_cost
+//     branch (include/simulation.h), but read-only (no state update) so it
+//     isolates the intra-event SIMD ceiling for the policy cost alone. Since
+//     the hidden layers (64-wide) exceed the warp width (32), each lane still
+//     does 2 serial passes per hidden layer — this does not add threads beyond
+//     one warp, it only parallelizes what a warp already covers.
+__global__ void bench_policy_kernel_warp(
+    const float* nn_params,
+    const int* nn_layer_sizes,
+    int nn_num_layers,
+    const float* inventory,        // [n_products, n_nodes_plus1] — read only
+    const float* capacity,         // [n_nodes_plus1] — read only
+    const int* event_products,     // [n_steps]
+    const int* event_quantities,   // [n_steps]
+    const int* event_ntf,          // [n_steps, n_nodes_plus1]
+    int n_steps,
+    int n_nodes_plus1,
+    int* fulfill
+) {
+    if (blockIdx.x != 0 || threadIdx.x >= 32) return;
+    const int lane = threadIdx.x;
+
+    __shared__ float s_a[MAX_NN_DIM];
+    __shared__ float s_b[MAX_NN_DIM];
+    __shared__ float s_out[MAX_NN_DIM];
+
+    const int in_size  = nn_layer_sizes[0];
+    const int out_size = nn_layer_sizes[nn_num_layers];
+
+    for (int i = 0; i < n_steps; i++) {
+        int product = event_products[i];
+        int quantity = event_quantities[i];
+        const int* node_ntf = event_ntf + (size_t)i * n_nodes_plus1;
+        const float* inv_row = inventory + (size_t)product * n_nodes_plus1;
+
+        // --- MLP forward pass, outputs split across lanes ---
+        float* a = s_a;
+        float* b = s_b;
+        for (int k = lane; k < in_size; k += 32) a[k] = inv_row[k];
+        __syncwarp();
+
+        int param_offset = 0;
+        for (int layer = 0; layer < nn_num_layers; layer++) {
+            int nin  = nn_layer_sizes[layer];
+            int nout = nn_layer_sizes[layer + 1];
+            const float* W = nn_params + param_offset;
+            const float* bias = W + nout * nin;
+            param_offset += nout * nin + nout;
+            bool last = (layer == nn_num_layers - 1);
+            float* dst = last ? s_out : b;
+            for (int k = lane; k < nout; k += 32) {
+                float sum = bias[k];
+                for (int j = 0; j < nin; j++) sum += W[k * nin + j] * a[j];
+                dst[k] = last ? sum : fmaxf(0.0f, sum);
+            }
+            __syncwarp();
+            if (!last) { float* t = a; a = b; b = t; }  // swap ping-pong
+        }
+
+        // --- logsumexp normalize over s_out[0..out_size) (warp reductions) ---
+        float* out = s_out;
+        float m = -1e30f;
+        for (int k = lane; k < out_size; k += 32) m = fmaxf(m, out[k]);
+        m = warp_reduce_max(m);
+        m = __shfl_sync(0xffffffffu, m, 0);
+        float se = 0.0f;
+        for (int k = lane; k < out_size; k += 32) se += expf(out[k] - m);
+        se = warp_reduce_sum(se);
+        se = __shfl_sync(0xffffffffu, se, 0);
+        float lse = m + logf(se);
+        for (int k = lane; k < out_size; k += 32) out[k] -= lse;
+        __syncwarp();
+
+        // --- norm of the (normalized) output ---
+        float nr = 0.0f;
+        for (int k = lane; k < n_nodes_plus1; k += 32) nr += out[k] * out[k];
+        nr = warp_reduce_sum(nr);
+        nr = __shfl_sync(0xffffffffu, nr, 0);
+        nr = sqrtf(nr + 1e-12f);
+
+        // --- feasibility scan (cheap, serial on lane 0) ---
+        if (lane == 0) {
+            int chosen = node_ntf[n_nodes_plus1 - 1];
+            for (int rank = 0; rank < n_nodes_plus1; rank++) {
+                int node = node_ntf[rank];
+                float iv = inv_row[node] + roundf(1e-7f * out[rank] / nr);
+                if (capacity[node] >= (float)quantity && iv >= (float)quantity) {
+                    chosen = node; break;
+                }
+            }
+            fulfill[i] = chosen;
+        }
+        __syncwarp();
+    }
+}
+
 // 2b. State update only: replay pre-computed fulfillment decisions,
 //     applying just the inventory and capacity decrements.
 __global__ void bench_state_update_kernel(
@@ -1099,6 +1197,36 @@ void run_benchmark(
             events.product, events.quantity, events.node_index_near_to_far,
             n_steps, np1, ful);
     });
+
+    // Capture the scalar-policy decisions as the oracle for the warp variant
+    // (a different decision function than dynamics-only, so it needs its own
+    // baseline — the NN-driven feasibility choice, not the greedy-nearest one).
+    std::vector<int> baseline_policy_fulfill(n_steps);
+    CUDA_CHECK(cudaMemcpy(baseline_policy_fulfill.data(), d_fulfill_out,
+                          n_steps * sizeof(int), cudaMemcpyDeviceToHost));
+
+    // 2b. Policy only, WARP-PARALLEL — same MLP matvec split across a warp's 32
+    // lanes as production's simulate_worker_kernel_warp, isolated with no state
+    // update. Like that kernel, the warp reductions reorder float adds, so this
+    // is checked with a node-decision match tolerance rather than bit-identity.
+    run_timed("policy-warp", [&](float* inv, float* cap, int* ful) {
+        bench_policy_kernel_warp<<<1, 32>>>(
+            nn.params, nn.layer_sizes, nn.num_layers,
+            inv, cap,
+            events.product, events.quantity, events.node_index_near_to_far,
+            n_steps, np1, ful);
+    });
+    {
+        std::vector<int> got(n_steps);
+        CUDA_CHECK(cudaMemcpy(got.data(), d_fulfill_out,
+                              n_steps * sizeof(int), cudaMemcpyDeviceToHost));
+        int mism = 0;
+        for (int i = 0; i < n_steps; i++)
+            if (got[i] != baseline_policy_fulfill[i]) mism++;
+        printf("  %-20s %s (%d/%d mismatches)\n", "policy-warp check",
+               mism == 0 ? "OK — identical" : "tolerance (warp reduction reorders floats)",
+               mism, n_steps);
+    }
 
     // 3. Full (NN + fulfillment + dynamics)
     run_timed("full", [&](float* inv, float* cap, int* ful) {

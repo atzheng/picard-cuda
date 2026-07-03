@@ -149,6 +149,19 @@ rule compact_npy:
 # 4. Build the CUDA binary
 # ---------------------------------------------------------------------------
 rule build:
+    input:
+        "CMakeLists.txt",
+        "src/main.cpp",
+        "src/data_loader.cpp",
+        "src/algorithm.cu",
+        "include/algorithm.h",
+        "include/data_loader.h",
+        "include/fulfillment.h",
+        "include/neural_net.h",
+        "include/rng.h",
+        "include/simulation.h",
+        "include/types.h",
+        "include/utils.h",
     output:
         "build/cuda_sim",
     shell:
