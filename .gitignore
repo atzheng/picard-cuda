@@ -4,6 +4,10 @@ build/
 # Datasets (large binary .npy / raw inputs — regenerate from source)
 data/
 
+# Benchmark outputs (regenerate via `snakemake`)
+results/
+.snakemake/
+
 # Editor / OS cruft
 *.swp
 .DS_Store
