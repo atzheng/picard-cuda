@@ -9,6 +9,8 @@ Pipeline:
     sequential_baseline -> single-thread scan (correctness oracle + speedup denominator)
     picard_benchmark -> one Picard run per worker count in WORKER_COUNTS
     summary          -> results/benchmark_summary.csv (timings, speedup, mismatches)
+    benchmark_perstep -> `--mode benchmark` per-event policy vs. state-update timing
+    plot             -> results/benchmark_plot.png (runtime & speedup vs. num workers)
 
 Usage:
     snakemake -j 8 --config s3_raw_uri=s3://bucket/path
@@ -40,12 +42,14 @@ config.setdefault("window_multiplier", 1.7)  # workers*steps ~= window_multiplie
                                               # (see experiments.md E10: this minimizes
                                               #  Picard iteration count on this workload)
 config.setdefault("seed", 42)
+config.setdefault("perstep_num_steps", 1000000)  # events replayed by `--mode benchmark`
 
 WORKERS = [int(w) for w in config["worker_counts"]]
 N_EVENTS = int(config["n_events"])
 N_PRODUCTS = int(config["num_products"])
 WINDOW_MULT = float(config["window_multiplier"])
 SEED = int(config["seed"])
+PERSTEP_NUM_STEPS = int(config["perstep_num_steps"])
 
 
 def steps_for(workers):
@@ -61,6 +65,8 @@ def mppw_for(workers):
 rule all:
     input:
         "results/benchmark_summary.csv",
+        "results/perstep_benchmark.txt",
+        "results/benchmark_plot.png",
 
 
 # ---------------------------------------------------------------------------
@@ -240,3 +246,37 @@ rule summary:
             writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             writer.writeheader()
             writer.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
+# 8. Per-step micro-benchmark: policy cost vs. state-update cost, single
+#    thread (`--mode benchmark`; independent of the worker sweep above).
+# ---------------------------------------------------------------------------
+rule benchmark_perstep:
+    input:
+        bin="build/cuda_sim",
+        order_products="data/full/npy/order_products.npy",
+    output:
+        "results/perstep_benchmark.txt",
+    params:
+        num_steps=PERSTEP_NUM_STEPS,
+    shell:
+        """
+        mkdir -p results
+        ./{input.bin} data/full/npy --mode benchmark --num_steps {params.num_steps} \
+            | tee {output}
+        """
+
+
+# ---------------------------------------------------------------------------
+# 9. Plot: wall time & speedup vs. num workers
+# ---------------------------------------------------------------------------
+rule plot:
+    input:
+        summary="results/benchmark_summary.csv",
+    output:
+        "results/benchmark_plot.png",
+    shell:
+        """
+        python3 scripts/plot_benchmark.py {input.summary} {output}
+        """

@@ -1,3 +1,4 @@
 snakemake>=7.32
 numpy
 pgeocode
+matplotlib
