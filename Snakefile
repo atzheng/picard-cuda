@@ -37,7 +37,7 @@ config.setdefault(
 )
 config.setdefault("num_products", 1000000)   # canonical product count for this dataset
 config.setdefault("n_events", 3000000)       # events in the raw dataset
-config.setdefault("worker_counts", [100, 1000, 10000, 100000])
+config.setdefault("worker_counts", [1, 3, 10, 100, 1000, 10000, 100000])
 config.setdefault("window_multiplier", 1.7)  # workers*steps ~= window_multiplier*n_events
                                               # (see experiments.md E10: this minimizes
                                               #  Picard iteration count on this workload)
