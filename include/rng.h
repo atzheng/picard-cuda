@@ -32,7 +32,7 @@ __host__ __device__ inline int rand_int(uint64_t& key, int n) {
 }
 
 // Bernoulli: returns true with probability p
-__host__ __device__ inline bool rand_bernoulli(uint64_t& key, float p) {
+__host__ __device__ inline bool rand_bernoulli(uint64_t& key, double p) {
     return rand_uniform(key) < p;
 }
 

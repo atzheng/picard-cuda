@@ -82,7 +82,7 @@ static NpyHeader parse_npy_header(std::ifstream& f) {
     return h;
 }
 
-static std::vector<float> read_npy_as_float(const std::string& path) {
+static std::vector<double> read_npy_as_double(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open " + path);
 
@@ -91,22 +91,22 @@ static std::vector<float> read_npy_as_float(const std::string& path) {
     size_t total = 1;
     for (auto s : h.shape) total *= s;
 
-    std::vector<float> result(total);
+    std::vector<double> result(total);
 
     if (h.descr == "<f8" || h.descr == "float64") {
-        std::vector<double> buf(total);
-        f.read(reinterpret_cast<char*>(buf.data()), total * sizeof(double));
-        for (size_t i = 0; i < total; i++) result[i] = (float)buf[i];
+        f.read(reinterpret_cast<char*>(result.data()), total * sizeof(double));
     } else if (h.descr == "<f4" || h.descr == "float32") {
-        f.read(reinterpret_cast<char*>(result.data()), total * sizeof(float));
+        std::vector<float> buf(total);
+        f.read(reinterpret_cast<char*>(buf.data()), total * sizeof(float));
+        for (size_t i = 0; i < total; i++) result[i] = (double)buf[i];
     } else if (h.descr == "<i8" || h.descr == "int64") {
         std::vector<int64_t> buf(total);
         f.read(reinterpret_cast<char*>(buf.data()), total * sizeof(int64_t));
-        for (size_t i = 0; i < total; i++) result[i] = (float)buf[i];
+        for (size_t i = 0; i < total; i++) result[i] = (double)buf[i];
     } else if (h.descr == "<i4" || h.descr == "int32") {
         std::vector<int32_t> buf(total);
         f.read(reinterpret_cast<char*>(buf.data()), total * sizeof(int32_t));
-        for (size_t i = 0; i < total; i++) result[i] = (float)buf[i];
+        for (size_t i = 0; i < total; i++) result[i] = (double)buf[i];
     } else {
         throw std::runtime_error("Unsupported dtype: " + h.descr);
     }
@@ -164,10 +164,10 @@ ProblemData load_problem(const std::string& directory, int day) {
     auto inv_shape = read_npy_shape(directory + sep + "inventory.npy");
     prob.n_products = (int)inv_shape[0];
     prob.n_nodes = (int)inv_shape[1];
-    prob.inventory = read_npy_as_float(directory + sep + "inventory.npy");
+    prob.inventory = read_npy_as_double(directory + sep + "inventory.npy");
 
     // Load capacity: [n_days, n_nodes] — extract single day
-    auto cap_all = read_npy_as_float(directory + sep + "capacity.npy");
+    auto cap_all = read_npy_as_double(directory + sep + "capacity.npy");
     auto cap_shape = read_npy_shape(directory + sep + "capacity.npy");
     prob.capacity.resize(prob.n_nodes);
     for (int n = 0; n < prob.n_nodes; n++) {

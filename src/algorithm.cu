@@ -58,23 +58,23 @@ AlgoState create_algo_state(
     int np1 = state.n_nodes_plus1;
 
     // Capacity: [n_nodes+1], with sentinel = inf
-    std::vector<float> cap_host(np1);
+    std::vector<double> cap_host(np1);
     for (int i = 0; i < problem.n_nodes; i++) cap_host[i] = problem.capacity[i];
-    cap_host[problem.n_nodes] = 1e30f;  // unfulfill sentinel capacity
-    CUDA_CHECK(cudaMalloc(&state.capacity, np1 * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(state.capacity, cap_host.data(), np1 * sizeof(float), cudaMemcpyHostToDevice));
+    cap_host[problem.n_nodes] = 1e30;  // unfulfill sentinel capacity
+    CUDA_CHECK(cudaMalloc(&state.capacity, np1 * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(state.capacity, cap_host.data(), np1 * sizeof(double), cudaMemcpyHostToDevice));
 
     // Inventory: [n_products, n_nodes+1], with sentinel column = inf
     int inv_size = problem.n_products * np1;
-    std::vector<float> inv_host(inv_size);
+    std::vector<double> inv_host(inv_size);
     for (int p = 0; p < problem.n_products; p++) {
         for (int n = 0; n < problem.n_nodes; n++) {
             inv_host[p * np1 + n] = problem.inventory[p * problem.n_nodes + n];
         }
-        inv_host[p * np1 + problem.n_nodes] = 1e30f;  // sentinel
+        inv_host[p * np1 + problem.n_nodes] = 1e30;  // sentinel
     }
-    CUDA_CHECK(cudaMalloc(&state.inventory, inv_size * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(state.inventory, inv_host.data(), inv_size * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&state.inventory, inv_size * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(state.inventory, inv_host.data(), inv_size * sizeof(double), cudaMemcpyHostToDevice));
 
     // Fulfill: [n_events], initialized to sentinel (unfulfill)
     std::vector<int> fulfill_host(problem.n_events, problem.n_nodes);  // sentinel = n_nodes
@@ -148,18 +148,18 @@ NeuralNet create_neural_net(const AlgoConfig& config, uint64_t seed) {
     nn.total_param_count = total;
 
     // Initialize params (random normal * 0.01)
-    std::vector<float> params_host(total);
+    std::vector<double> params_host(total);
     uint64_t rng = seed;
     for (int i = 0; i < total; i++) {
         // Box-Muller for normal distribution
-        float u1 = rand_uniform(rng);
-        float u2 = rand_uniform(rng);
-        float z = sqrtf(-2.0f * logf(u1 + 1e-30f)) * cosf(2.0f * 3.14159265f * u2);
-        params_host[i] = z * 0.01f;
+        double u1 = rand_uniform(rng);
+        double u2 = rand_uniform(rng);
+        double z = sqrt(-2.0 * log(u1 + 1e-30)) * cos(2.0 * 3.14159265358979323846 * u2);
+        params_host[i] = z * 0.01;
     }
 
-    CUDA_CHECK(cudaMalloc(&nn.params, total * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(nn.params, params_host.data(), total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&nn.params, total * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(nn.params, params_host.data(), total * sizeof(double), cudaMemcpyHostToDevice));
 
     // Layer sizes on device
     CUDA_CHECK(cudaMalloc(&nn.layer_sizes, config.layer_sizes.size() * sizeof(int)));
@@ -207,8 +207,8 @@ struct IterContext {
 
     // Authoritative mutable state, resident on the host across the whole loop.
     // (h_inventory is fully written by the init D2H before any read → no-init.)
-    std::vector<float> h_capacity;
-    NoInitVec<float> h_inventory;
+    std::vector<double> h_capacity;
+    NoInitVec<double> h_inventory;
     std::vector<int>   h_fulfill;
 
     // Persistent host scratch (sized once in init, refilled each iteration —
@@ -231,7 +231,7 @@ struct IterContext {
     NoInitVec<unsigned char> present;  // window presence bitmap for max_t_reset
 
     // Persistent device scratch (allocated once, reused each iteration).
-    float* d_inv_scratch = nullptr;     // [n_products, np1] — fresh inventory copy/iter (P13)
+    double* d_inv_scratch = nullptr;    // [n_products, np1] — fresh inventory copy/iter (P13)
     int* d_ev_product = nullptr;
     int* d_ev_quantity = nullptr;
     const int* d_event_ntf_full = nullptr;  // borrowed: events.node_index_near_to_far (not owned)
@@ -240,8 +240,8 @@ struct IterContext {
     int* d_slice_fulfill = nullptr;         // [eff]
     int* d_slice_quantities = nullptr;      // [eff]
     int* d_order_2D_relative = nullptr;     // [evc], in [0,eff) or -1
-    float* d_cumsum = nullptr;              // [eff, np1] device scratch
-    float* d_cap_delta = nullptr;           // [evc, np1] — now written by the gather kernel
+    double* d_cumsum = nullptr;             // [eff, np1] device scratch
+    double* d_cap_delta = nullptr;          // [evc, np1] — now written by the gather kernel
     int* d_valid_mask = nullptr;
     uint64_t* d_worker_keys = nullptr;
     int* d_fulfill_2D = nullptr;
@@ -289,9 +289,9 @@ static void init_iter_context(
     ctx.h_inventory.resize((size_t)ctx.n_products * np1);
     ctx.h_fulfill.resize(ctx.n_events);
     CUDA_CHECK(cudaMemcpy(ctx.h_capacity.data(), s.capacity,
-                          np1 * sizeof(float), cudaMemcpyDeviceToHost));
+                          np1 * sizeof(double), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(ctx.h_inventory.data(), s.inventory,
-                          (size_t)ctx.n_products * np1 * sizeof(float), cudaMemcpyDeviceToHost));
+                          (size_t)ctx.n_products * np1 * sizeof(double), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(ctx.h_fulfill.data(), s.fulfill,
                           ctx.n_events * sizeof(int), cudaMemcpyDeviceToHost));
     mark("D2H state");
@@ -324,16 +324,16 @@ static void init_iter_context(
     // Per-iteration buffer sizes depend only on config dims, so allocate once.
     // d_inv_scratch holds the full inventory ([n_products, np1]) — a fresh copy of
     // the authoritative host inventory is uploaded into it each iteration (P13).
-    CUDA_CHECK(cudaMalloc(&ctx.d_inv_scratch, (size_t)ctx.n_products * np1 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx.d_inv_scratch, (size_t)ctx.n_products * np1 * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&ctx.d_ev_product, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_ev_quantity, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_order_2D_index, ctx.ev_count * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&ctx.d_cap_delta, ctx.ev_count * np1 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx.d_cap_delta, ctx.ev_count * np1 * sizeof(double)));
     // GPU capacity-delta scratch + inputs (P9).
     CUDA_CHECK(cudaMalloc(&ctx.d_slice_fulfill, (size_t)ens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_slice_quantities, (size_t)ens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_order_2D_relative, ctx.ev_count * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&ctx.d_cumsum, (size_t)ens * np1 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx.d_cumsum, (size_t)ens * np1 * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&ctx.d_valid_mask, ctx.ev_count * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ctx.d_worker_keys, ctx.n_workers * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&ctx.d_fulfill_2D, ctx.ev_count * sizeof(int)));
@@ -343,9 +343,9 @@ static void init_iter_context(
 // Push the final authoritative host state back to the device once, after the loop.
 static void finalize_iter_context(IterContext& ctx, AlgoState& s) {
     CUDA_CHECK(cudaMemcpy(s.capacity, ctx.h_capacity.data(),
-                          ctx.np1 * sizeof(float), cudaMemcpyHostToDevice));
+                          ctx.np1 * sizeof(double), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(s.inventory, ctx.h_inventory.data(),
-                          (size_t)ctx.n_products * ctx.np1 * sizeof(float), cudaMemcpyHostToDevice));
+                          (size_t)ctx.n_products * ctx.np1 * sizeof(double), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(s.fulfill, ctx.h_fulfill.data(),
                           ctx.n_events * sizeof(int), cudaMemcpyHostToDevice));
 }
@@ -381,7 +381,7 @@ static void iterate_core(
     int max_ppw = ctx.max_ppw;
 
     // Authoritative state lives in the context — no per-iteration D2H copies.
-    std::vector<float>& h_capacity = ctx.h_capacity;
+    std::vector<double>& h_capacity = ctx.h_capacity;
     auto& h_inventory = ctx.h_inventory;
     std::vector<int>& h_fulfill = ctx.h_fulfill;
     std::vector<int>& h_event_products = ctx.h_event_products;
@@ -501,7 +501,7 @@ static void iterate_core(
     // Upload a fresh copy of the authoritative inventory (70 MB) for the kernel to
     // mutate as per-iteration scratch (P13) — replaces the 124 MB worker_inv reshape.
     CUDA_CHECK(cudaMemcpy(ctx.d_inv_scratch, h_inventory.data(),
-                          (size_t)n_products * np1 * sizeof(float), cudaMemcpyHostToDevice));
+                          (size_t)n_products * np1 * sizeof(double), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_ev_product, ev2d_product.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx.d_ev_quantity, ev2d_quantity.data(), ev_count * sizeof(int), cudaMemcpyHostToDevice));
     // P12: upload the per-slot global event index (4 MB) instead of the per-window
@@ -518,7 +518,7 @@ static void iterate_core(
     // The kernel reads its initial capacity from the device; sync the current
     // (pre-step) host capacity into the device buffer just before launch.
     CUDA_CHECK(cudaMemcpy(algo_state.capacity, h_capacity.data(),
-                          np1 * sizeof(float), cudaMemcpyHostToDevice));
+                          np1 * sizeof(double), cudaMemcpyHostToDevice));
 
     if (prof.on) { prof.h2d += prof_now() - tp; tp = prof_now(); }
 
@@ -536,12 +536,13 @@ static void iterate_core(
             n_workers, num_steps, eff_num_steps, np1, ctx.d_cap_delta);
     }
 
-    // Launch the fulfillment kernel. Default: warp-cooperative (P8) — one warp per
-    // worker, parallelizing the per-event MLP across lanes. Set LEGACY_KERNEL=1 to
-    // use the original one-thread-per-worker scan (bit-identical reference).
-    static const bool legacy_kernel = (getenv("LEGACY_KERNEL") != nullptr);
-    if (legacy_kernel) {
-        simulate_worker_kernel<<<n_workers, 1>>>(
+    // Launch the fulfillment kernel. Default: one thread per worker (bit-identical
+    // scalar scan). Set WARP_KERNEL=1 to use the warp-cooperative variant (P8)
+    // instead, which parallelizes the per-event MLP across a warp's lanes.
+    static const bool warp_kernel = (getenv("WARP_KERNEL") != nullptr);
+    if (warp_kernel) {
+        int blocks = (n_workers + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        simulate_worker_kernel_warp<<<blocks, WARPS_PER_BLOCK * 32>>>(
             nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
             ctx.d_inv_scratch, algo_state.capacity,
             ctx.d_ev_product, ctx.d_ev_quantity,
@@ -551,8 +552,7 @@ static void iterate_core(
             ctx.d_fulfill_2D
         );
     } else {
-        int blocks = (n_workers + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-        simulate_worker_kernel_warp<<<blocks, WARPS_PER_BLOCK * 32>>>(
+        simulate_worker_kernel<<<n_workers, 1>>>(
             nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
             ctx.d_inv_scratch, algo_state.capacity,
             ctx.d_ev_product, ctx.d_ev_quantity,
@@ -616,7 +616,7 @@ static void iterate_core(
     }
     int update_end = std::min(new_t_reset, n_events);
     for (int i = algo_state.t_reset; i < update_end; i++) {
-        float qty = (float)h_event_quantities[i];
+        double qty = (double)h_event_quantities[i];
         int prod = h_event_products[i];
         int node = h_fulfill[i];
         h_inventory[prod * np1 + node] -= qty;
@@ -698,12 +698,12 @@ void run_algorithm_day(
 // No worker partitioning, no conflict detection — just a straight scan.
 
 __global__ void simulate_sequential_kernel(
-    const float* nn_params,
+    const double* nn_params,
     const int* nn_layer_sizes,
     int nn_num_layers,
-    float greedy_cost_prob,
-    float* inventory,              // [n_products, n_nodes_plus1] — modified in place
-    float* capacity,               // [n_nodes_plus1] — modified in place
+    double greedy_cost_prob,
+    double* inventory,             // [n_products, n_nodes_plus1] — modified in place
+    double* capacity,              // [n_nodes_plus1] — modified in place
     const int* event_products,     // [n_events]
     const int* event_quantities,   // [n_events]
     const int* event_ntf,          // [n_events, n_nodes_plus1]
@@ -714,9 +714,9 @@ __global__ void simulate_sequential_kernel(
 ) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-    float scratch_a[MAX_NN_DIM];
-    float scratch_b[MAX_NN_DIM];
-    float nn_output[MAX_NN_DIM];
+    double scratch_a[MAX_NN_DIM];
+    double scratch_b[MAX_NN_DIM];
+    double nn_output[MAX_NN_DIM];
 
     uint64_t key = rng_key;
 
@@ -724,7 +724,7 @@ __global__ void simulate_sequential_kernel(
         int product = event_products[i];
         int quantity = event_quantities[i];
         const int* node_ntf = event_ntf + (size_t)i * n_nodes_plus1;
-        float* inv_row = inventory + (size_t)product * n_nodes_plus1;
+        double* inv_row = inventory + (size_t)product * n_nodes_plus1;
 
         uint64_t subkey;
         split_key(key, key, subkey);
@@ -739,8 +739,8 @@ __global__ void simulate_sequential_kernel(
         fulfill[i] = node;
 
         // Update state
-        inv_row[node] -= (float)quantity;
-        capacity[node] -= (float)quantity;
+        inv_row[node] -= (double)quantity;
+        capacity[node] -= (double)quantity;
     }
 }
 
@@ -775,8 +775,8 @@ void run_sequential_day(
 // 1. Dynamics only: greedy nearest feasible node, no NN.
 //    Measures pure state-update throughput.
 __global__ void bench_dynamics_only_kernel(
-    float* inventory,              // [n_products, n_nodes_plus1]
-    float* capacity,               // [n_nodes_plus1]
+    double* inventory,             // [n_products, n_nodes_plus1]
+    double* capacity,              // [n_nodes_plus1]
     const int* event_products,     // [n_steps]
     const int* event_quantities,   // [n_steps]
     const int* event_ntf,          // [n_steps, n_nodes_plus1]
@@ -790,21 +790,21 @@ __global__ void bench_dynamics_only_kernel(
         int product = event_products[i];
         int quantity = event_quantities[i];
         const int* node_ntf = event_ntf + (size_t)i * n_nodes_plus1;
-        float* inv_row = inventory + (size_t)product * n_nodes_plus1;
+        double* inv_row = inventory + (size_t)product * n_nodes_plus1;
 
         // Greedy nearest: first feasible node in near-to-far order
         int node = node_ntf[n_nodes_plus1 - 1]; // default: unfulfill
         for (int rank = 0; rank < n_nodes_plus1; rank++) {
             int n = node_ntf[rank];
-            if (capacity[n] >= (float)quantity && inv_row[n] >= (float)quantity) {
+            if (capacity[n] >= (double)quantity && inv_row[n] >= (double)quantity) {
                 node = n;
                 break;
             }
         }
 
         fulfill[i] = node;
-        inv_row[node] -= (float)quantity;
-        capacity[node] -= (float)quantity;
+        inv_row[node] -= (double)quantity;
+        capacity[node] -= (double)quantity;
     }
 }
 
@@ -814,8 +814,8 @@ __global__ void bench_dynamics_only_kernel(
 //   - cross-iteration L2 prefetch of the next event's inventory row to hide the
 //     dominant random global-load latency in this single-thread sequential scan
 __global__ void bench_dynamics_only_kernel_opt(
-    float* __restrict__ inventory,        // [n_products, n_nodes_plus1]
-    float* __restrict__ capacity,         // [n_nodes_plus1]
+    double* __restrict__ inventory,        // [n_products, n_nodes_plus1]
+    double* __restrict__ capacity,         // [n_nodes_plus1]
     const int* __restrict__ event_products,     // [n_steps]
     const int* __restrict__ event_quantities,   // [n_steps]
     const int* __restrict__ event_ntf,          // [n_steps, n_nodes_plus1]
@@ -829,24 +829,24 @@ __global__ void bench_dynamics_only_kernel_opt(
     const int PF_DIST = 8;  // software-pipeline depth: prefetch this many events ahead
 
     // Hot capacity vector lives on-chip for the whole scan.
-    __shared__ float cap[MAX_NODES];
+    __shared__ double cap[MAX_NODES];
     for (int n = 0; n < np1; n++) cap[n] = capacity[n];
 
     // Warm the pipeline: kick off the first PF_DIST inventory-row loads.
     for (int j = 0; j < PF_DIST && j < n_steps; j++) {
-        const float* p = inventory + (size_t)event_products[j] * np1;
+        const double* p = inventory + (size_t)event_products[j] * np1;
         asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
     }
 
     for (int i = 0; i < n_steps; i++) {
         int product = event_products[i];
-        float q = (float)event_quantities[i];
+        double q = (double)event_quantities[i];
         const int* __restrict__ node_ntf = event_ntf + (size_t)i * np1;
-        float* __restrict__ inv_row = inventory + (size_t)product * np1;
+        double* __restrict__ inv_row = inventory + (size_t)product * np1;
 
         // Keep the pipeline full: prefetch the event PF_DIST ahead.
         if (i + PF_DIST < n_steps) {
-            const float* nxt = inventory + (size_t)event_products[i + PF_DIST] * np1;
+            const double* nxt = inventory + (size_t)event_products[i + PF_DIST] * np1;
             asm volatile("prefetch.global.L2 [%0];" :: "l"(nxt));
         }
 
@@ -874,8 +874,8 @@ __global__ void bench_dynamics_only_kernel_opt(
 //   __ffs selects the first feasible node in near-to-far order. The cross-event
 //   capacity recurrence stays sequential in shared memory.
 __global__ void bench_dynamics_only_kernel_warp(
-    float* __restrict__ inventory,        // [n_products, n_nodes_plus1]
-    float* __restrict__ capacity,         // [n_nodes_plus1]
+    double* __restrict__ inventory,        // [n_products, n_nodes_plus1]
+    double* __restrict__ capacity,         // [n_nodes_plus1]
     const int* __restrict__ event_products,
     const int* __restrict__ event_quantities,
     const int* __restrict__ event_ntf,
@@ -888,15 +888,15 @@ __global__ void bench_dynamics_only_kernel_warp(
     if (lane >= 32) return;
     const int np1 = n_nodes_plus1;        // assumed <= 32
 
-    __shared__ float cap[MAX_NODES];
+    __shared__ double cap[MAX_NODES];
     if (lane < np1) cap[lane] = capacity[lane];
     __syncwarp();
 
     for (int i = 0; i < n_steps; i++) {
         int product = event_products[i];
-        float q = (float)event_quantities[i];
+        double q = (double)event_quantities[i];
         const int* __restrict__ node_ntf = event_ntf + (size_t)i * np1;
-        const float* __restrict__ inv_row = inventory + (size_t)product * np1;
+        const double* __restrict__ inv_row = inventory + (size_t)product * np1;
 
         // Each lane evaluates one rank in near-to-far order.
         int node_at_rank = -1;
@@ -930,11 +930,11 @@ __global__ void bench_dynamics_only_kernel_warp(
 // 2. Policy only: NN forward pass + greedy-cost dispatch per event.
 //    No state update — measures the full policy decision cost.
 __global__ void bench_policy_kernel(
-    const float* nn_params,
+    const double* nn_params,
     const int* nn_layer_sizes,
     int nn_num_layers,
-    const float* inventory,        // [n_products, n_nodes_plus1] — read only
-    const float* capacity,         // [n_nodes_plus1] — read only
+    const double* inventory,       // [n_products, n_nodes_plus1] — read only
+    const double* capacity,        // [n_nodes_plus1] — read only
     const int* event_products,     // [n_steps]
     const int* event_quantities,   // [n_steps]
     const int* event_ntf,          // [n_steps, n_nodes_plus1]
@@ -944,15 +944,15 @@ __global__ void bench_policy_kernel(
 ) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-    float scratch_a[MAX_NN_DIM];
-    float scratch_b[MAX_NN_DIM];
-    float nn_output[MAX_NN_DIM];
+    double scratch_a[MAX_NN_DIM];
+    double scratch_b[MAX_NN_DIM];
+    double nn_output[MAX_NN_DIM];
 
     for (int i = 0; i < n_steps; i++) {
         int product = event_products[i];
         int quantity = event_quantities[i];
         const int* node_ntf = event_ntf + (size_t)i * n_nodes_plus1;
-        const float* inv_row = inventory + (size_t)product * n_nodes_plus1;
+        const double* inv_row = inventory + (size_t)product * n_nodes_plus1;
 
         fulfill[i] = fulfillment_greedy_cost(
             nn_params, nn_layer_sizes, nn_num_layers,
@@ -971,11 +971,11 @@ __global__ void bench_policy_kernel(
 //     does 2 serial passes per hidden layer — this does not add threads beyond
 //     one warp, it only parallelizes what a warp already covers.
 __global__ void bench_policy_kernel_warp(
-    const float* nn_params,
+    const double* nn_params,
     const int* nn_layer_sizes,
     int nn_num_layers,
-    const float* inventory,        // [n_products, n_nodes_plus1] — read only
-    const float* capacity,         // [n_nodes_plus1] — read only
+    const double* inventory,       // [n_products, n_nodes_plus1] — read only
+    const double* capacity,        // [n_nodes_plus1] — read only
     const int* event_products,     // [n_steps]
     const int* event_quantities,   // [n_steps]
     const int* event_ntf,          // [n_steps, n_nodes_plus1]
@@ -986,9 +986,9 @@ __global__ void bench_policy_kernel_warp(
     if (blockIdx.x != 0 || threadIdx.x >= 32) return;
     const int lane = threadIdx.x;
 
-    __shared__ float s_a[MAX_NN_DIM];
-    __shared__ float s_b[MAX_NN_DIM];
-    __shared__ float s_out[MAX_NN_DIM];
+    __shared__ double s_a[MAX_NN_DIM];
+    __shared__ double s_b[MAX_NN_DIM];
+    __shared__ double s_out[MAX_NN_DIM];
 
     const int in_size  = nn_layer_sizes[0];
     const int out_size = nn_layer_sizes[nn_num_layers];
@@ -997,11 +997,11 @@ __global__ void bench_policy_kernel_warp(
         int product = event_products[i];
         int quantity = event_quantities[i];
         const int* node_ntf = event_ntf + (size_t)i * n_nodes_plus1;
-        const float* inv_row = inventory + (size_t)product * n_nodes_plus1;
+        const double* inv_row = inventory + (size_t)product * n_nodes_plus1;
 
         // --- MLP forward pass, outputs split across lanes ---
-        float* a = s_a;
-        float* b = s_b;
+        double* a = s_a;
+        double* b = s_b;
         for (int k = lane; k < in_size; k += 32) a[k] = inv_row[k];
         __syncwarp();
 
@@ -1009,48 +1009,48 @@ __global__ void bench_policy_kernel_warp(
         for (int layer = 0; layer < nn_num_layers; layer++) {
             int nin  = nn_layer_sizes[layer];
             int nout = nn_layer_sizes[layer + 1];
-            const float* W = nn_params + param_offset;
-            const float* bias = W + nout * nin;
+            const double* W = nn_params + param_offset;
+            const double* bias = W + nout * nin;
             param_offset += nout * nin + nout;
             bool last = (layer == nn_num_layers - 1);
-            float* dst = last ? s_out : b;
+            double* dst = last ? s_out : b;
             for (int k = lane; k < nout; k += 32) {
-                float sum = bias[k];
+                double sum = bias[k];
                 for (int j = 0; j < nin; j++) sum += W[k * nin + j] * a[j];
-                dst[k] = last ? sum : fmaxf(0.0f, sum);
+                dst[k] = last ? sum : fmax(0.0, sum);
             }
             __syncwarp();
-            if (!last) { float* t = a; a = b; b = t; }  // swap ping-pong
+            if (!last) { double* t = a; a = b; b = t; }  // swap ping-pong
         }
 
         // --- logsumexp normalize over s_out[0..out_size) (warp reductions) ---
-        float* out = s_out;
-        float m = -1e30f;
-        for (int k = lane; k < out_size; k += 32) m = fmaxf(m, out[k]);
+        double* out = s_out;
+        double m = -1e30;
+        for (int k = lane; k < out_size; k += 32) m = fmax(m, out[k]);
         m = warp_reduce_max(m);
         m = __shfl_sync(0xffffffffu, m, 0);
-        float se = 0.0f;
-        for (int k = lane; k < out_size; k += 32) se += expf(out[k] - m);
+        double se = 0.0;
+        for (int k = lane; k < out_size; k += 32) se += exp(out[k] - m);
         se = warp_reduce_sum(se);
         se = __shfl_sync(0xffffffffu, se, 0);
-        float lse = m + logf(se);
+        double lse = m + log(se);
         for (int k = lane; k < out_size; k += 32) out[k] -= lse;
         __syncwarp();
 
         // --- norm of the (normalized) output ---
-        float nr = 0.0f;
+        double nr = 0.0;
         for (int k = lane; k < n_nodes_plus1; k += 32) nr += out[k] * out[k];
         nr = warp_reduce_sum(nr);
         nr = __shfl_sync(0xffffffffu, nr, 0);
-        nr = sqrtf(nr + 1e-12f);
+        nr = sqrt(nr + 1e-12);
 
         // --- feasibility scan (cheap, serial on lane 0) ---
         if (lane == 0) {
             int chosen = node_ntf[n_nodes_plus1 - 1];
             for (int rank = 0; rank < n_nodes_plus1; rank++) {
                 int node = node_ntf[rank];
-                float iv = inv_row[node] + roundf(1e-7f * out[rank] / nr);
-                if (capacity[node] >= (float)quantity && iv >= (float)quantity) {
+                double iv = inv_row[node] + round(1e-7 * out[rank] / nr);
+                if (capacity[node] >= (double)quantity && iv >= (double)quantity) {
                     chosen = node; break;
                 }
             }
@@ -1063,8 +1063,8 @@ __global__ void bench_policy_kernel_warp(
 // 2b. State update only: replay pre-computed fulfillment decisions,
 //     applying just the inventory and capacity decrements.
 __global__ void bench_state_update_kernel(
-    float* inventory,              // [n_products, n_nodes_plus1] — modified
-    float* capacity,               // [n_nodes_plus1] — modified
+    double* inventory,             // [n_products, n_nodes_plus1] — modified
+    double* capacity,              // [n_nodes_plus1] — modified
     const int* event_products,     // [n_steps]
     const int* event_quantities,   // [n_steps]
     const int* precomputed_fulfill,// [n_steps] — pre-computed node decisions
@@ -1075,9 +1075,9 @@ __global__ void bench_state_update_kernel(
 
     for (int i = 0; i < n_steps; i++) {
         int product = event_products[i];
-        float q = (float)event_quantities[i];
+        double q = (double)event_quantities[i];
         int node = precomputed_fulfill[i];
-        float* inv_row = inventory + (size_t)product * n_nodes_plus1;
+        double* inv_row = inventory + (size_t)product * n_nodes_plus1;
 
         inv_row[node] -= q;
         capacity[node] -= q;
@@ -1103,10 +1103,10 @@ void run_benchmark(
            n_steps, np1 - 1, n_products);
 
     // We need fresh copies of inventory/capacity for each run since the kernels mutate them
-    size_t inv_bytes = (size_t)n_products * np1 * sizeof(float);
-    size_t cap_bytes = (size_t)np1 * sizeof(float);
+    size_t inv_bytes = (size_t)n_products * np1 * sizeof(double);
+    size_t cap_bytes = (size_t)np1 * sizeof(double);
 
-    float *d_inv_copy, *d_cap_copy;
+    double *d_inv_copy, *d_cap_copy;
     int* d_fulfill_out;
     CUDA_CHECK(cudaMalloc(&d_inv_copy, inv_bytes));
     CUDA_CHECK(cudaMalloc(&d_cap_copy, cap_bytes));
@@ -1145,7 +1145,7 @@ void run_benchmark(
     };
 
     // 1. Dynamics only (baseline)
-    run_timed("dynamics-only", [&](float* inv, float* cap, int* ful) {
+    run_timed("dynamics-only", [&](double* inv, double* cap, int* ful) {
         bench_dynamics_only_kernel<<<1, 1>>>(
             inv, cap,
             events.product, events.quantity, events.node_index_near_to_far,
@@ -1158,7 +1158,7 @@ void run_benchmark(
                           n_steps * sizeof(int), cudaMemcpyDeviceToHost));
 
     // 1b. Dynamics only (optimized)
-    run_timed("dynamics-only-opt", [&](float* inv, float* cap, int* ful) {
+    run_timed("dynamics-only-opt", [&](double* inv, double* cap, int* ful) {
         bench_dynamics_only_kernel_opt<<<1, 1>>>(
             inv, cap,
             events.product, events.quantity, events.node_index_near_to_far,
@@ -1180,7 +1180,7 @@ void run_benchmark(
 
     // 1c. Dynamics only (warp-parallel) — only valid when a node row fits in a warp.
     if (np1 <= 32) {
-        run_timed("dynamics-only-warp", [&](float* inv, float* cap, int* ful) {
+        run_timed("dynamics-only-warp", [&](double* inv, double* cap, int* ful) {
             bench_dynamics_only_kernel_warp<<<1, 32>>>(
                 inv, cap,
                 events.product, events.quantity, events.node_index_near_to_far,
@@ -1190,7 +1190,7 @@ void run_benchmark(
     }
 
     // 2. Policy only (NN + greedy-cost dispatch, no state update)
-    run_timed("policy", [&](float* inv, float* cap, int* ful) {
+    run_timed("policy", [&](double* inv, double* cap, int* ful) {
         bench_policy_kernel<<<1, 1>>>(
             nn.params, nn.layer_sizes, nn.num_layers,
             inv, cap,
@@ -1207,9 +1207,9 @@ void run_benchmark(
 
     // 2b. Policy only, WARP-PARALLEL — same MLP matvec split across a warp's 32
     // lanes as production's simulate_worker_kernel_warp, isolated with no state
-    // update. Like that kernel, the warp reductions reorder float adds, so this
+    // update. Like that kernel, the warp reductions reorder double adds, so this
     // is checked with a node-decision match tolerance rather than bit-identity.
-    run_timed("policy-warp", [&](float* inv, float* cap, int* ful) {
+    run_timed("policy-warp", [&](double* inv, double* cap, int* ful) {
         bench_policy_kernel_warp<<<1, 32>>>(
             nn.params, nn.layer_sizes, nn.num_layers,
             inv, cap,
@@ -1224,12 +1224,12 @@ void run_benchmark(
         for (int i = 0; i < n_steps; i++)
             if (got[i] != baseline_policy_fulfill[i]) mism++;
         printf("  %-20s %s (%d/%d mismatches)\n", "policy-warp check",
-               mism == 0 ? "OK — identical" : "tolerance (warp reduction reorders floats)",
+               mism == 0 ? "OK — identical" : "tolerance (warp reduction reorders doubles)",
                mism, n_steps);
     }
 
     // 3. Full (NN + fulfillment + dynamics)
-    run_timed("full", [&](float* inv, float* cap, int* ful) {
+    run_timed("full", [&](double* inv, double* cap, int* ful) {
         simulate_sequential_kernel<<<1, 1>>>(
             nn.params, nn.layer_sizes, nn.num_layers, nn.greedy_cost_prob,
             inv, cap,
@@ -1252,7 +1252,7 @@ void run_benchmark(
             n_steps, np1, algo_state.rng_key, d_precomputed);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        run_timed("state-update", [&](float* inv, float* cap, int* ful) {
+        run_timed("state-update", [&](double* inv, double* cap, int* ful) {
             (void)ful;
             bench_state_update_kernel<<<1, 1>>>(
                 inv, cap,

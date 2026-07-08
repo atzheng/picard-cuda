@@ -3,18 +3,18 @@
 #include <vector>
 #include <cuda_runtime.h>
 
-// All arrays use float32 for numerical stability
+// All arrays use float64 for numerical stability
 // Index arrays use int32
 
 struct NeuralNet {
     // Stored as flat arrays on device; layer_offsets describes layout
     // Each layer: weights (nout x nin) followed by biases (nout)
-    float* params;          // device pointer to flat parameter buffer
+    double* params;         // device pointer to flat parameter buffer
     int* layer_sizes;       // host: e.g. {30, 64, 64, 31}
     int num_layers;         // number of weight layers (len(sizes) - 1)
-    int total_param_count;  // total floats in params buffer
+    int total_param_count;  // total doubles in params buffer
 
-    float greedy_cost_prob; // probability of using greedy-cost vs greedy-capacity
+    double greedy_cost_prob; // probability of using greedy-cost vs greedy-capacity
 };
 
 struct Event {
@@ -27,8 +27,8 @@ struct Event {
 };
 
 struct WorkerState {
-    float* inventory;   // [max_products_per_worker, n_nodes+1]
-    float* capacity;    // [n_nodes+1]
+    double* inventory;  // [max_products_per_worker, n_nodes+1]
+    double* capacity;   // [n_nodes+1]
     uint64_t rng_key;
 };
 
@@ -36,8 +36,8 @@ struct AlgoState {
     int iteration;
     int t_reset;
     int n_conflicts;
-    float* capacity;    // [n_nodes+1] device
-    float* inventory;   // [n_products, n_nodes+1] device
+    double* capacity;   // [n_nodes+1] device
+    double* inventory;  // [n_products, n_nodes+1] device
     int* fulfill;       // [n_events] device
     uint64_t rng_key;
 
@@ -49,9 +49,9 @@ struct AlgoState {
 // Host-side problem description loaded from numpy files
 struct ProblemData {
     // inventory[product, node] — shape [n_products, n_nodes]
-    std::vector<float> inventory;
+    std::vector<double> inventory;
     // capacity[node] — shape [n_nodes] (single day)
-    std::vector<float> capacity;
+    std::vector<double> capacity;
     // order products — shape [n_events]
     std::vector<int> order_products;
     // node_index_near_to_far[order, node_rank] — shape [n_events, n_nodes]
@@ -69,6 +69,6 @@ struct AlgoConfig {
     int num_steps;
     int max_iters;
     std::vector<int> layer_sizes;  // e.g. {30, 64, 64, 31}
-    float greedy_cost_prob;
+    double greedy_cost_prob;
     int seed;
 };

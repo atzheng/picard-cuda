@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
     config.num_steps = 10;
     config.max_iters = 10000000;
     config.layer_sizes = {30, 64, 64, 31};
-    config.greedy_cost_prob = 1.0f;
+    config.greedy_cost_prob = 1.0;
     config.seed = 42;
 
     std::string output;
@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             config.seed = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--greedy_cost_prob") == 0 && i + 1 < argc) {
-            config.greedy_cost_prob = (float)atof(argv[++i]);
+            config.greedy_cost_prob = atof(argv[++i]);
         } else if (strcmp(argv[i], "--layer_sizes") == 0 && i + 1 < argc) {
             config.layer_sizes = parse_layer_sizes(argv[++i]);
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
