@@ -44,12 +44,36 @@ config.setdefault("window_multiplier", 1.7)  # workers*steps ~= window_multiplie
 config.setdefault("seed", 42)
 config.setdefault("perstep_num_steps", 1000000)  # events replayed by `--mode benchmark`
 
+# Per-step micro-benchmark swept across neural-net parameter counts, ~3x / 10x /
+# 100x / 300x the 8,159-param baseline ([30,64,64,31] on this 30-node dataset).
+# Each hidden layer is capped at 128 units — the kernels' MAX_NN_DIM scratch
+# limit (include/simulation.h) — so the larger nets scale by DEPTH, not width.
+# num_steps shrinks for the bigger nets because `--mode benchmark` times a single
+# CUDA thread; the binary reports us/event, which normalizes across step counts.
+# (width, depth) below hit each target to within 0.01% of the exact multiple.
+config.setdefault("nn_size_sweep", [
+    {"mult": 3,   "width": 128, "depth": 2,   "num_steps": 30000},  # 24,479 params
+    {"mult": 10,  "width": 69,  "depth": 17,  "num_steps": 8000},   # 81,589 params
+    {"mult": 100, "width": 68,  "depth": 174, "num_steps": 800},    # 815,963 params
+    {"mult": 300, "width": 87,  "depth": 320, "num_steps": 300},    # 2,447,689 params
+])
+
 WORKERS = [int(w) for w in config["worker_counts"]]
 N_EVENTS = int(config["n_events"])
 N_PRODUCTS = int(config["num_products"])
 WINDOW_MULT = float(config["window_multiplier"])
 SEED = int(config["seed"])
 PERSTEP_NUM_STEPS = int(config["perstep_num_steps"])
+NN_SWEEP = {str(e["mult"]): e for e in config["nn_size_sweep"]}
+
+
+def nn_layer_sizes(width, depth, n_in=30, n_out=31):
+    """MLP layer sizes string: n_in, [width]*depth hidden, n_out.
+
+    The binary auto-adjusts the first/last entries to n_nodes / n_nodes+1, so
+    n_in/n_out here just document the shape on the canonical 30-node dataset.
+    """
+    return ",".join(str(x) for x in [n_in] + [width] * depth + [n_out])
 
 
 def steps_for(workers):
@@ -66,6 +90,7 @@ rule all:
     input:
         "results/benchmark_summary.csv",
         "results/perstep_benchmark.txt",
+        "results/perstep_nn_sizes.csv",
         "results/benchmark_plot.png",
 
 
@@ -279,6 +304,79 @@ rule benchmark_perstep:
         ./{input.bin} data/full/npy --mode benchmark --num_steps {params.num_steps} \
             | tee {output}
         """
+
+
+# ---------------------------------------------------------------------------
+# 8b. Per-step micro-benchmark swept across NN sizes (policy cost vs. parameter
+#     count). One `--mode benchmark` run per entry in `nn_size_sweep`, then a
+#     tidy CSV of us/event per kernel per size.
+# ---------------------------------------------------------------------------
+rule benchmark_nn_size:
+    input:
+        bin="build/cuda_sim",
+        order_products="data/full/npy/order_products.npy",
+    output:
+        "results/nn_sizes/perstep_{mult}x.txt",
+    params:
+        layer_sizes=lambda w: nn_layer_sizes(NN_SWEEP[w.mult]["width"],
+                                             NN_SWEEP[w.mult]["depth"]),
+        num_steps=lambda w: NN_SWEEP[w.mult]["num_steps"],
+    shell:
+        """
+        mkdir -p results/nn_sizes
+        ./{input.bin} data/full/npy --mode benchmark \
+            --num_steps {params.num_steps} --layer_sizes {params.layer_sizes} \
+            | tee {output}
+        """
+
+
+rule benchmark_nn_sizes:
+    input:
+        expand("results/nn_sizes/perstep_{mult}x.txt",
+               mult=[str(e["mult"]) for e in config["nn_size_sweep"]]),
+    output:
+        "results/perstep_nn_sizes.csv",
+    run:
+        import re, csv
+
+        def params(width, depth, n_in=30, n_out=31):
+            ls = [n_in] + [width] * depth + [n_out]
+            return sum(ls[i + 1] * (ls[i] + 1) for i in range(len(ls) - 1))
+
+        # label -> us/event, parsed from lines like:
+        #   policy               35880.773 ms  (1196.026 us/event)
+        row_re = re.compile(r"^\s*([\w-]+)\s+[\d.]+\s*ms\s*\(\s*([\d.]+)\s*us/event\)")
+        hdr_re = re.compile(r"=== Benchmark: (\d+) events, (\d+) nodes, (\d+) products ===")
+        kernels = ["dynamics-only", "dynamics-only-opt", "dynamics-only-warp",
+                   "policy", "policy-warp", "full", "state-update"]
+
+        rows = []
+        for mult_e, path in zip(config["nn_size_sweep"], input):
+            per = {}
+            n_steps = None
+            with open(path) as f:
+                for line in f:
+                    h = hdr_re.search(line)
+                    if h:
+                        n_steps = int(h.group(1))
+                    m = row_re.match(line)
+                    if m:
+                        per[m.group(1)] = float(m.group(2))
+            rows.append({
+                "mult": mult_e["mult"],
+                "params": params(mult_e["width"], mult_e["depth"]),
+                "width": mult_e["width"],
+                "depth": mult_e["depth"],
+                "num_steps": n_steps,
+                **{f"{k}_us_per_event": per.get(k, "") for k in kernels},
+            })
+
+        fields = ["mult", "params", "width", "depth", "num_steps"] + \
+                 [f"{k}_us_per_event" for k in kernels]
+        with open(output[0], "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(rows)
 
 
 # ---------------------------------------------------------------------------
